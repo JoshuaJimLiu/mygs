@@ -205,6 +205,9 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
+    args.test_iterations += [x for x in range(0, 100, args.iterations) if x not in args.test_iterations]
+
+    
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
