@@ -362,7 +362,7 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
-    test_iterations = [x for x in range(0, args.iterations + 1, 100)]
+    test_iterations = [x for x in range(0, args.iterations + 1, 1000)]
     print("Optimizing " + args.model_path)
 
     safe_state(args.quiet)
