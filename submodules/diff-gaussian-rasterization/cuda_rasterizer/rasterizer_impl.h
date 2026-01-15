@@ -1,18 +1,8 @@
-/*
- * Copyright (C) 2023, Inria
- * GRAPHDECO research group, https://team.inria.fr/graphdeco
- * All rights reserved.
- *
- * This software is free for non-commercial, research and evaluation use 
- * under the terms of the LICENSE.md file.
- *
- * For inquiries contact  george.drettakis@inria.fr
- */
-
 #pragma once
 
 #include <iostream>
 #include <vector>
+#include <cstdint>            // <- for std::uintptr_t
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
 
@@ -64,11 +54,12 @@ namespace CudaRasterizer
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 
-	template<typename T> 
-	size_t required(size_t P)
+	// Make required(...) match the signature of T::fromChunk(...)
+	template<typename T, typename... Args>
+	size_t required(Args... args)
 	{
 		char* size = nullptr;
-		T::fromChunk(size, P);
+		T::fromChunk(size, args...);
 		return ((size_t)size) + 128;
 	}
 };

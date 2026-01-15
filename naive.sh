@@ -2,7 +2,7 @@
 mkdir -p log
 
 
-for dir in "bicycle" "bonsai" "counter" "garden" "kitchen" "room" "stump"
+for dir in "bonsai" "bicycle" "counter" "garden" "kitchen" "room" "stump"
 do
 python train.py -s ./data/$dir/ --eval | tee -a log/$dir.log
 

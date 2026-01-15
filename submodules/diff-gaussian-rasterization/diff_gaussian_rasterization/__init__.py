@@ -194,8 +194,17 @@ class GaussianRasterizer(nn.Module):
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
         
-        if shs is None:
-            shs = torch.Tensor([])
+        # check background dims to determine if grayscale or RGB rendering
+        background_dims = raster_settings.bg.shape[0]
+        if background_dims == 1:
+            # use one-dim sh
+            shs_ = shs[:,:,0]
+        elif background_dims == 3:
+            # use three-dim sh
+            shs_ = shs
+
+        if shs_ is None:
+            shs_ = torch.Tensor([])
         if colors_precomp is None:
             colors_precomp = torch.Tensor([])
 
@@ -210,7 +219,7 @@ class GaussianRasterizer(nn.Module):
         return rasterize_gaussians(
             means3D,
             means2D,
-            shs,
+            shs_,
             colors_precomp,
             opacities,
             scales, 

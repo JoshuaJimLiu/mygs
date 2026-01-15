@@ -119,7 +119,13 @@ def training(dataset, opt, pipe,
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    if color_loss == "gray":
+        print("Using grayscale (luma-Y) training loss.")
+        bg_color = [0] if dataset.white_background else [1] # automatically deduce channels in cuda backend
+    else:
+        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+
+        print("Using RGB training loss.")
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing=True)
@@ -159,7 +165,7 @@ def training(dataset, opt, pipe,
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
+        if iteration % 1000 == 0 and color_loss == "rgb":
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
@@ -362,7 +368,7 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
-    test_iterations = [x for x in range(0, args.iterations + 1, 100)]
+    test_iterations = [x for x in range(0, args.iterations + 1, 500)]
     print("Optimizing " + args.model_path)
 
     safe_state(args.quiet)
