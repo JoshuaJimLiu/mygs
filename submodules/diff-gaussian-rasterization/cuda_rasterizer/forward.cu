@@ -11,6 +11,7 @@
 
 #include "forward.h"
 #include "auxiliary.h"
+#include <stdexcept>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -68,6 +69,59 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	clamped[3 * idx + 1] = (result.y < 0);
 	clamped[3 * idx + 2] = (result.z < 0);
 	return glm::max(result, 0.0f);
+}
+
+// [NEW] Forward method for converting the input spherical harmonics
+// coefficients of each Gaussian to a simple grayscale color.
+__device__ float computeColorFromSH1(int idx, int deg, int max_coeffs,
+    const glm::vec3* means, glm::vec3 campos,
+    const float* shs, bool* clamped)
+{
+    glm::vec3 pos = means[idx];
+    glm::vec3 dir = pos - campos;
+    dir = dir / glm::length(dir);
+
+    const float* sh = shs + idx * max_coeffs;
+    float result = SH_C0 * sh[0];
+
+    if (deg > 0)
+    {
+        float x = dir.x;
+        float y = dir.y;
+        float z = dir.z;
+        result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
+
+        if (deg > 1)
+        {
+            float xx = x * x, yy = y * y, zz = z * z;
+            float xy = x * y, yz = y * z, xz = x * z;
+            result = result +
+                SH_C2[0] * xy * sh[4] +
+                SH_C2[1] * yz * sh[5] +
+                SH_C2[2] * (2.0f * zz - xx - yy) * sh[6] +
+                SH_C2[3] * xz * sh[7] +
+                SH_C2[4] * (xx - yy) * sh[8];
+
+            if (deg > 2)
+            {
+                result = result +
+                    SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
+                    SH_C3[1] * xy * z * sh[10] +
+                    SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[11] +
+                    SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[12] +
+                    SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[13] +
+                    SH_C3[5] * z * (xx - yy) * sh[14] +
+                    SH_C3[6] * x * (xx - 3.0f * yy) * sh[15];
+            }
+        }
+    }
+
+    result += 0.5f;
+
+    // Grayscale is clamped to positive values. If values are
+    // clamped, we need to keep track of this for the backward pass.
+    clamped[idx] = (result < 0.0f);
+    return max(result, 0.0f);
 }
 
 // Forward version of 2D covariance matrix computation
@@ -377,82 +431,126 @@ renderCUDA(
 }
 
 void FORWARD::render(
-	const dim3 grid, dim3 block,
-	const uint2* ranges,
-	const uint32_t* point_list,
-	int W, int H,
-	const float2* means2D,
-	const float* colors,
-	const float4* conic_opacity,
-	float* final_T,
-	uint32_t* n_contrib,
-	const float* bg_color,
-	float* out_color)
+    const dim3 grid, dim3 block,
+    const uint2* ranges,
+    const uint32_t* point_list,
+    int W, int H,
+    const float2* means2D,
+    const float* colors,
+    const float4* conic_opacity,
+    float* final_T,
+    uint32_t* n_contrib,
+    const float* bg_color,
+    float* out_color,
+    int channels) // [NEW]
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
-		ranges,
-		point_list,
-		W, H,
-		means2D,
-		colors,
-		conic_opacity,
-		final_T,
-		n_contrib,
-		bg_color,
-		out_color);
+    if (channels == 1)
+    {
+        renderCUDA<1> <<<grid, block>>> (
+            ranges, point_list, W, H,
+            means2D, colors, conic_opacity,
+            final_T, n_contrib, bg_color, out_color);
+    }
+    else if (channels == 3)
+    {
+        renderCUDA<3> <<<grid, block>>> (
+            ranges, point_list, W, H,
+            means2D, colors, conic_opacity,
+            final_T, n_contrib, bg_color, out_color);
+    }
+    else
+    {
+        throw std::runtime_error("FORWARD::render only supports channels == 1 or 3.");
+    }
 }
 
 void FORWARD::preprocess(int P, int D, int M,
-	const float* means3D,
-	const glm::vec3* scales,
-	const float scale_modifier,
-	const glm::vec4* rotations,
-	const float* opacities,
-	const float* shs,
-	bool* clamped,
-	const float* cov3D_precomp,
-	const float* colors_precomp,
-	const float* viewmatrix,
-	const float* projmatrix,
-	const glm::vec3* cam_pos,
-	const int W, int H,
-	const float focal_x, float focal_y,
-	const float tan_fovx, float tan_fovy,
-	int* radii,
-	float2* means2D,
-	float* depths,
-	float* cov3Ds,
-	float* rgb,
-	float4* conic_opacity,
-	const dim3 grid,
-	uint32_t* tiles_touched,
-	bool prefiltered)
+    const float* means3D,
+    const glm::vec3* scales,
+    const float scale_modifier,
+    const glm::vec4* rotations,
+    const float* opacities,
+    const float* shs,
+    bool* clamped,
+    const float* cov3D_precomp,
+    const float* colors_precomp,
+    const float* viewmatrix,
+    const float* projmatrix,
+    const glm::vec3* cam_pos,
+    const int W, int H,
+    const float focal_x, float focal_y,
+    const float tan_fovx, float tan_fovy,
+    int* radii,
+    float2* means2D,
+    float* depths,
+    float* cov3Ds,
+    float* rgb,
+    float4* conic_opacity,
+    const dim3 grid,
+    uint32_t* tiles_touched,
+    bool prefiltered,
+    int channels) // [NEW]
 {
-	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
-		P, D, M,
-		means3D,
-		scales,
-		scale_modifier,
-		rotations,
-		opacities,
-		shs,
-		clamped,
-		cov3D_precomp,
-		colors_precomp,
-		viewmatrix, 
-		projmatrix,
-		cam_pos,
-		W, H,
-		tan_fovx, tan_fovy,
-		focal_x, focal_y,
-		radii,
-		means2D,
-		depths,
-		cov3Ds,
-		rgb,
-		conic_opacity,
-		grid,
-		tiles_touched,
-		prefiltered
-		);
+    if (channels == 1)
+    {
+        preprocessCUDA<1> <<< (P + 255) / 256, 256 >>> (
+            P, D, M,
+            means3D,
+            scales,
+            scale_modifier,
+            rotations,
+            opacities,
+            shs,
+            clamped,
+            cov3D_precomp,
+            colors_precomp,
+            viewmatrix,
+            projmatrix,
+            cam_pos,
+            W, H,
+            tan_fovx, tan_fovy,
+            focal_x, focal_y,
+            radii,
+            means2D,
+            depths,
+            cov3Ds,
+            rgb,
+            conic_opacity,
+            grid,
+            tiles_touched,
+            prefiltered);
+    }
+    else if (channels == 3)
+    {
+        preprocessCUDA<3> <<< (P + 255) / 256, 256 >>> (
+            P, D, M,
+            means3D,
+            scales,
+            scale_modifier,
+            rotations,
+            opacities,
+            shs,
+            clamped,
+            cov3D_precomp,
+            colors_precomp,
+            viewmatrix,
+            projmatrix,
+            cam_pos,
+            W, H,
+            tan_fovx, tan_fovy,
+            focal_x, focal_y,
+            radii,
+            means2D,
+            depths,
+            cov3Ds,
+            rgb,
+            conic_opacity,
+            grid,
+            tiles_touched,
+            prefiltered);
+    }
+    else
+    {
+        throw std::runtime_error("FORWARD::preprocess only supports channels == 1 or 3.");
+    }
 }

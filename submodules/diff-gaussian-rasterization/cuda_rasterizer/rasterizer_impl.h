@@ -40,7 +40,7 @@ namespace CudaRasterizer
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
 
-		static GeometryState fromChunk(char*& chunk, size_t P);
+		static GeometryState fromChunk(char*& chunk, size_t P, int channels);
 	};
 
 	struct ImageState
@@ -49,7 +49,7 @@ namespace CudaRasterizer
 		uint32_t* n_contrib;
 		float* accum_alpha;
 
-		static ImageState fromChunk(char*& chunk, size_t N);
+		static ImageState fromChunk(char*& chunk, size_t numPixels, size_t numTiles);
 	};
 
 	struct BinningState

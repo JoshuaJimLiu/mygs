@@ -169,12 +169,12 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	return geom;
 }
 
-CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
+CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t numPixels, size_t numTiles)
 {
 	ImageState img;
-	obtain(chunk, img.accum_alpha, N, 128);
-	obtain(chunk, img.n_contrib, N, 128);
-	obtain(chunk, img.ranges, N, 128);
+	obtain(chunk, img.accum_alpha, numPixels, 128);
+	obtain(chunk, img.n_contrib, numPixels, 128);
+	obtain(chunk, img.ranges, numTiles, 128);
 	return img;
 }
 
@@ -199,7 +199,7 @@ int CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> geometryBuffer,
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
-	const int P, int D, int M,
+	const int P, int D, int M, int channels,
 	const float* background,
 	const int width, int height,
 	const float* means3D,
@@ -222,6 +222,11 @@ int CudaRasterizer::Rasterizer::forward(
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
+	if (channels != 1 && channels != 3)
+	{
+		throw std::runtime_error("Only 1 or 3 channels are supported!");
+	}
+
 	size_t chunk_size = required<GeometryState>(P);
 	char* chunkptr = geometryBuffer(chunk_size);
 	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
@@ -235,18 +240,24 @@ int CudaRasterizer::Rasterizer::forward(
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
 	// Dynamically resize image-based auxiliary buffers during training
+	const size_t numPixels = (size_t)width * (size_t)height;
+	const size_t numTiles = (size_t)tile_grid.x * (size_t)tile_grid.y;
 	size_t img_chunk_size = required<ImageState>(width * height);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
-	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, numPixels, numTiles);
 
-	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
+	// NOTE: Original code required precomputed colors for non-RGB modes.
+	// In the "channels==1" setting, we allow either:
+	//   - grayscale SHs (shs != nullptr), or
+	//   - precomputed grayscale colors (colors_precomp != nullptr).
+	if (colors_precomp == nullptr && shs == nullptr)
 	{
-		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
+		throw std::runtime_error("Provide either SHs or precomputed Gaussian colors!");
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	CHECK_CUDA(FORWARD::preprocess(
-		P, D, M,
+		P, D, M, channels,
 		means3D,
 		(glm::vec3*)scales,
 		scale_modifier,
@@ -330,7 +341,8 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
-		out_color), debug)
+		out_color,
+		channels), debug)
 
 	return num_rendered;
 }
@@ -338,7 +350,7 @@ int CudaRasterizer::Rasterizer::forward(
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
 void CudaRasterizer::Rasterizer::backward(
-	const int P, int D, int M, int R,
+	const int P, int D, int M, int R, int channels,
 	const float* background,
 	const int width, int height,
 	const float* means3D,
@@ -368,9 +380,18 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_drot,
 	bool debug)
 {
+	if (channels != 1 && channels != 3)
+	{
+		throw std::runtime_error("Only 1 or 3 channels are supported!");
+	}
+
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
-	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
+
+	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	const size_t numPixels = (size_t)width * (size_t)height;
+	const size_t numTiles = (size_t)tile_grid.x * (size_t)tile_grid.y;
+	ImageState imgState = ImageState::fromChunk(img_buffer, numPixels, numTiles);
 
 	if (radii == nullptr)
 	{
@@ -380,7 +401,6 @@ void CudaRasterizer::Rasterizer::backward(
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
 
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
@@ -403,13 +423,14 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dcolor,
+		channels), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
 	// use the one we computed ourselves.
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
-	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
+	CHECK_CUDA(BACKWARD::preprocess(P, D, M, channels,
 		(float3*)means3D,
 		radii,
 		shs,

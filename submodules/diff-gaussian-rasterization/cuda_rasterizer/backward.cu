@@ -138,6 +138,137 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
 
+// Backward pass for conversion of spherical harmonics to GRAYSCALE for
+// each Gaussian.
+__device__ void computeColorFromSH(
+    int idx, int deg, int max_coeffs,
+    const glm::vec3* means, glm::vec3 campos,
+    const float* shs, const bool* clamped,
+    const float* dL_dcolor,
+    glm::vec3* dL_dmeans,
+    float* dL_dshs)
+{
+    // Compute intermediate values, as it is done during forward
+    glm::vec3 pos = means[idx];
+    glm::vec3 dir_orig = pos - campos;
+    glm::vec3 dir = dir_orig / glm::length(dir_orig);
+
+    const float* sh = shs + idx * max_coeffs;
+
+    // Use PyTorch rule for clamping: if clamping was applied,
+    // gradient becomes 0.
+    float dL_dI = dL_dcolor[idx];
+    dL_dI *= clamped[idx] ? 0.0f : 1.0f;
+
+    float dIdx = 0.0f;
+    float dIdy = 0.0f;
+    float dIdz = 0.0f;
+
+    float x = dir.x;
+    float y = dir.y;
+    float z = dir.z;
+
+    // Target location for this Gaussian to write SH gradients to
+    float* dL_dsh = dL_dshs + idx * max_coeffs;
+
+    // No tricks here, just high school-level calculus.
+    float dIdsh0 = SH_C0;
+    dL_dsh[0] = dIdsh0 * dL_dI;
+    if (deg > 0)
+    {
+        float dIdsh1 = -SH_C1 * y;
+        float dIdsh2 =  SH_C1 * z;
+        float dIdsh3 = -SH_C1 * x;
+        dL_dsh[1] = dIdsh1 * dL_dI;
+        dL_dsh[2] = dIdsh2 * dL_dI;
+        dL_dsh[3] = dIdsh3 * dL_dI;
+
+        dIdx = -SH_C1 * sh[3];
+        dIdy = -SH_C1 * sh[1];
+        dIdz =  SH_C1 * sh[2];
+
+        if (deg > 1)
+        {
+            float xx = x * x, yy = y * y, zz = z * z;
+            float xy = x * y, yz = y * z, xz = x * z;
+
+            float dIdsh4 = SH_C2[0] * xy;
+            float dIdsh5 = SH_C2[1] * yz;
+            float dIdsh6 = SH_C2[2] * (2.f * zz - xx - yy);
+            float dIdsh7 = SH_C2[3] * xz;
+            float dIdsh8 = SH_C2[4] * (xx - yy);
+            dL_dsh[4] = dIdsh4 * dL_dI;
+            dL_dsh[5] = dIdsh5 * dL_dI;
+            dL_dsh[6] = dIdsh6 * dL_dI;
+            dL_dsh[7] = dIdsh7 * dL_dI;
+            dL_dsh[8] = dIdsh8 * dL_dI;
+
+            dIdx += SH_C2[0] * y * sh[4] + SH_C2[2] * 2.f * -x * sh[6] + SH_C2[3] * z * sh[7] + SH_C2[4] * 2.f * x * sh[8];
+            dIdy += SH_C2[0] * x * sh[4] + SH_C2[1] * z * sh[5] + SH_C2[2] * 2.f * -y * sh[6] + SH_C2[4] * 2.f * -y * sh[8];
+            dIdz += SH_C2[1] * y * sh[5] + SH_C2[2] * 2.f * 2.f * z * sh[6] + SH_C2[3] * x * sh[7];
+
+            if (deg > 2)
+            {
+                float dIdsh9  = SH_C3[0] * y * (3.f * xx - yy);
+                float dIdsh10 = SH_C3[1] * xy * z;
+                float dIdsh11 = SH_C3[2] * y * (4.f * zz - xx - yy);
+                float dIdsh12 = SH_C3[3] * z * (2.f * zz - 3.f * xx - 3.f * yy);
+                float dIdsh13 = SH_C3[4] * x * (4.f * zz - xx - yy);
+                float dIdsh14 = SH_C3[5] * z * (xx - yy);
+                float dIdsh15 = SH_C3[6] * x * (xx - 3.f * yy);
+                dL_dsh[9]  = dIdsh9  * dL_dI;
+                dL_dsh[10] = dIdsh10 * dL_dI;
+                dL_dsh[11] = dIdsh11 * dL_dI;
+                dL_dsh[12] = dIdsh12 * dL_dI;
+                dL_dsh[13] = dIdsh13 * dL_dI;
+                dL_dsh[14] = dIdsh14 * dL_dI;
+                dL_dsh[15] = dIdsh15 * dL_dI;
+
+                dIdx += (
+                    SH_C3[0] * sh[9]  * 3.f * 2.f * xy +
+                    SH_C3[1] * sh[10] * yz +
+                    SH_C3[2] * sh[11] * -2.f * xy +
+                    SH_C3[3] * sh[12] * -3.f * 2.f * xz +
+                    SH_C3[4] * sh[13] * (-3.f * xx + 4.f * zz - yy) +
+                    SH_C3[5] * sh[14] * 2.f * xz +
+                    SH_C3[6] * sh[15] * 3.f * (xx - yy));
+
+                dIdy += (
+                    SH_C3[0] * sh[9]  * 3.f * (xx - yy) +
+                    SH_C3[1] * sh[10] * xz +
+                    SH_C3[2] * sh[11] * (-3.f * yy + 4.f * zz - xx) +
+                    SH_C3[3] * sh[12] * -3.f * 2.f * yz +
+                    SH_C3[4] * sh[13] * -2.f * xy +
+                    SH_C3[5] * sh[14] * -2.f * yz +
+                    SH_C3[6] * sh[15] * -3.f * 2.f * xy);
+
+                dIdz += (
+                    SH_C3[1] * sh[10] * xy +
+                    SH_C3[2] * sh[11] * 4.f * 2.f * yz +
+                    SH_C3[3] * sh[12] * 3.f * (2.f * zz - xx - yy) +
+                    SH_C3[4] * sh[13] * 4.f * 2.f * xz +
+                    SH_C3[5] * sh[14] * (xx - yy));
+            }
+        }
+    }
+
+    // The view direction is an input to the computation. View direction
+    // is influenced by the Gaussian's mean, so SHs gradients
+    // must propagate back into 3D position.
+    float3 dL_ddir = float3{ dIdx * dL_dI, dIdy * dL_dI, dIdz * dL_dI };
+
+    // Account for normalization of direction
+    float3 dL_dmean = dnormvdv(
+        float3{ dir_orig.x, dir_orig.y, dir_orig.z },
+        dL_ddir);
+
+    // Gradients of loss w.r.t. Gaussian means, but only the portion
+    // that is caused because the mean affects the view-dependent color.
+    // Additional mean gradient is accumulated in below methods.
+    dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
+}
+
+
 // Backward version of INVERSE 2D covariance matrix computation
 // (due to length launched as separate kernel before other 
 // backward steps contained in preprocess)
@@ -388,7 +519,14 @@ __global__ void preprocessCUDA(
 
 	// Compute gradient updates due to computing colors from SHs
 	if (shs)
-		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
+	{
+		if constexpr (C == 3)
+			computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped,
+				(glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
+		else if constexpr (C == 1)
+			computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped,
+				(float*)dL_dcolor, (glm::vec3*)dL_dmeans, (float*)dL_dsh);
+	}
 
 	// Compute gradient updates due to computing covariance from scale/rotation
 	if (scales)
@@ -557,101 +695,159 @@ renderCUDA(
 }
 
 void BACKWARD::preprocess(
-	int P, int D, int M,
-	const float3* means3D,
-	const int* radii,
-	const float* shs,
-	const bool* clamped,
-	const glm::vec3* scales,
-	const glm::vec4* rotations,
-	const float scale_modifier,
-	const float* cov3Ds,
-	const float* viewmatrix,
-	const float* projmatrix,
-	const float focal_x, float focal_y,
-	const float tan_fovx, float tan_fovy,
-	const glm::vec3* campos,
-	const float3* dL_dmean2D,
-	const float* dL_dconic,
-	glm::vec3* dL_dmean3D,
-	float* dL_dcolor,
-	float* dL_dcov3D,
-	float* dL_dsh,
-	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+    int channels,
+    int P, int D, int M,
+    const float3* means3D,
+    const int* radii,
+    const float* shs,
+    const bool* clamped,
+    const glm::vec3* scales,
+    const glm::vec4* rotations,
+    const float scale_modifier,
+    const float* cov3Ds,
+    const float* viewmatrix,
+    const float* projmatrix,
+    const float focal_x, float focal_y,
+    const float tan_fovx, float tan_fovy,
+    const glm::vec3* campos,
+    const float3* dL_dmean2D,
+    const float* dL_dconic,
+    glm::vec3* dL_dmean3D,
+    float* dL_dcolor,
+    float* dL_dcov3D,
+    float* dL_dsh,
+    glm::vec3* dL_dscale,
+    glm::vec4* dL_drot)
 {
-	// Propagate gradients for the path of 2D conic matrix computation. 
-	// Somewhat long, thus it is its own kernel rather than being part of 
-	// "preprocess". When done, loss gradient w.r.t. 3D means has been
-	// modified and gradient w.r.t. 3D covariance matrix has been computed.	
-	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
-		P,
-		means3D,
-		radii,
-		cov3Ds,
-		focal_x,
-		focal_y,
-		tan_fovx,
-		tan_fovy,
-		viewmatrix,
-		dL_dconic,
-		(float3*)dL_dmean3D,
-		dL_dcov3D);
+    // Propagate gradients for the path of 2D conic matrix computation.
+    // Somewhat long, thus it is its own kernel rather than being part of
+    // "preprocess". When done, loss gradient w.r.t. 3D means has been
+    // modified and gradient w.r.t. 3D covariance matrix has been computed.
+    computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
+        P,
+        means3D,
+        radii,
+        cov3Ds,
+        focal_x,
+        focal_y,
+        tan_fovx,
+        tan_fovy,
+        viewmatrix,
+        dL_dconic,
+        (float3*)dL_dmean3D,
+        dL_dcov3D);
 
-	// Propagate gradients for remaining steps: finish 3D mean gradients,
-	// propagate color gradients to SH (if desireD), propagate 3D covariance
-	// matrix gradients to scale and rotation.
-	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
-		P, D, M,
-		(float3*)means3D,
-		radii,
-		shs,
-		clamped,
-		(glm::vec3*)scales,
-		(glm::vec4*)rotations,
-		scale_modifier,
-		projmatrix,
-		campos,
-		(float3*)dL_dmean2D,
-		(glm::vec3*)dL_dmean3D,
-		dL_dcolor,
-		dL_dcov3D,
-		dL_dsh,
-		dL_dscale,
-		dL_drot);
+    // Propagate gradients for remaining steps: finish 3D mean gradients,
+    // propagate color gradients to SH (if desireD), propagate 3D covariance
+    // matrix gradients to scale and rotation.
+    switch (channels)
+    {
+    case 1:
+        preprocessCUDA<1> << < (P + 255) / 256, 256 >> > (
+            P, D, M,
+            (float3*)means3D,
+            radii,
+            shs,
+            clamped,
+            (glm::vec3*)scales,
+            (glm::vec4*)rotations,
+            scale_modifier,
+            projmatrix,
+            campos,
+            (float3*)dL_dmean2D,
+            (glm::vec3*)dL_dmean3D,
+            dL_dcolor,
+            dL_dcov3D,
+            dL_dsh,
+            dL_dscale,
+            dL_drot);
+        break;
+
+    case 3:
+        preprocessCUDA<3> << < (P + 255) / 256, 256 >> > (
+            P, D, M,
+            (float3*)means3D,
+            radii,
+            shs,
+            clamped,
+            (glm::vec3*)scales,
+            (glm::vec4*)rotations,
+            scale_modifier,
+            projmatrix,
+            campos,
+            (float3*)dL_dmean2D,
+            (glm::vec3*)dL_dmean3D,
+            dL_dcolor,
+            dL_dcov3D,
+            dL_dsh,
+            dL_dscale,
+            dL_drot);
+        break;
+
+    default:
+        throw std::runtime_error("BACKWARD::preprocess: channels must be 1 or 3");
+    }
 }
 
 void BACKWARD::render(
-	const dim3 grid, const dim3 block,
-	const uint2* ranges,
-	const uint32_t* point_list,
-	int W, int H,
-	const float* bg_color,
-	const float2* means2D,
-	const float4* conic_opacity,
-	const float* colors,
-	const float* final_Ts,
-	const uint32_t* n_contrib,
-	const float* dL_dpixels,
-	float3* dL_dmean2D,
-	float4* dL_dconic2D,
-	float* dL_dopacity,
-	float* dL_dcolors)
+    int channels,
+    const dim3 grid, const dim3 block,
+    const uint2* ranges,
+    const uint32_t* point_list,
+    int W, int H,
+    const float* bg_color,
+    const float2* means2D,
+    const float4* conic_opacity,
+    const float* colors,
+    const float* final_Ts,
+    const uint32_t* n_contrib,
+    const float* dL_dpixels,
+    float3* dL_dmean2D,
+    float4* dL_dconic2D,
+    float* dL_dopacity,
+    float* dL_dcolors)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
-		ranges,
-		point_list,
-		W, H,
-		bg_color,
-		means2D,
-		conic_opacity,
-		colors,
-		final_Ts,
-		n_contrib,
-		dL_dpixels,
-		dL_dmean2D,
-		dL_dconic2D,
-		dL_dopacity,
-		dL_dcolors
-		);
+    switch (channels)
+    {
+    case 1:
+        renderCUDA<1> << <grid, block >> >(
+            ranges,
+            point_list,
+            W, H,
+            bg_color,
+            means2D,
+            conic_opacity,
+            colors,
+            final_Ts,
+            n_contrib,
+            dL_dpixels,
+            dL_dmean2D,
+            dL_dconic2D,
+            dL_dopacity,
+            dL_dcolors
+            );
+        break;
+
+    case 3:
+        renderCUDA<3> << <grid, block >> >(
+            ranges,
+            point_list,
+            W, H,
+            bg_color,
+            means2D,
+            conic_opacity,
+            colors,
+            final_Ts,
+            n_contrib,
+            dL_dpixels,
+            dL_dmean2D,
+            dL_dconic2D,
+            dL_dopacity,
+            dL_dcolors
+            );
+        break;
+
+    default:
+        throw std::runtime_error("BACKWARD::render: channels must be 1 or 3");
+    }
 }
