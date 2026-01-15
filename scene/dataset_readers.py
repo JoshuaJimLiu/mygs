@@ -151,7 +151,6 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
-
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
     ply_path = os.path.join(path, "sparse/0/points3D.ply")

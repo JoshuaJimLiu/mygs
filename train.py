@@ -43,7 +43,7 @@ def rgb_to_luma(rgb_chw: torch.Tensor) -> torch.Tensor:
     r = rgb_chw[0:1]
     g = rgb_chw[1:2]
     b = rgb_chw[2:3]
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return 0.299 * r + 0.587 * g + 0.114 * b
 
 
 def save_psnr_curve(psnr_records, out_dir: str, tb_writer=None):
