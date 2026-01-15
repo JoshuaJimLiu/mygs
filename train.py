@@ -33,7 +33,7 @@ except ImportError:
 
 
 # ---------------------------
-# Helper: RGB -> Luma (Y)
+# Helper: RGB -> Luma (Y) Image.convert() Rev. 601
 # ---------------------------
 def rgb_to_luma(rgb_chw: torch.Tensor) -> torch.Tensor:
     """
