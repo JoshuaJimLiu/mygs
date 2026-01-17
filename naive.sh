@@ -11,7 +11,9 @@ do
 # python train.py -s ./data/$dir/ --grad_weight 1.2 --chroma_edge_weight 1.5 --edge_quantile 0.995 --eval | tee -a log/${dir}_gray_usesh_weighted_3.log
 
 
-python train.py -s ./dataGray/$dir/ --eval --color_loss "rgb" | tee -a log/${dir}_gray_as_rgb_no_sh.log
+python train.py --expname "grayAsRGB_SH_${dir}" \
+ -s ./dataGray/$dir/ --eval --color_loss "rgb" | tee -a log/${dir}_gray_as_rgb_use_sh.log
+
 
 done
 

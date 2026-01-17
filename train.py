@@ -62,8 +62,8 @@ def sobel_grad_1ch(y_1hw: torch.Tensor) -> torch.Tensor:
                        [-2, 0, 2],
                        [-1, 0, 1]], dtype=y.dtype, device=y.device).view(1, 1, 3, 3)
     ky = torch.tensor([[-1, -2, -1],
-                       [ 0,  0,  0],
-                       [ 1,  2,  1]], dtype=y.dtype, device=y.device).view(1, 1, 3, 3)
+                       [0, 0, 0],
+                       [1, 2, 1]], dtype=y.dtype, device=y.device).view(1, 1, 3, 3)
 
     gx = F.conv2d(y, kx, padding=1)  # (1,1,H,W)
     gy = F.conv2d(y, ky, padding=1)  # (1,1,H,W)
@@ -79,7 +79,7 @@ def sobel_grad_3ch(rgb_3hw: torch.Tensor) -> torch.Tensor:
     assert rgb_3hw.dim() == 3 and rgb_3hw.shape[0] == 3
     out = []
     for c in range(3):
-        gc = sobel_grad_1ch(rgb_3hw[c:c+1])
+        gc = sobel_grad_1ch(rgb_3hw[c:c + 1])
         out.append(gc)
     return torch.cat(out, dim=0)  # (6,H,W)
 
@@ -90,10 +90,7 @@ def robust_norm01(x_hw: torch.Tensor, q: float = 0.995, eps: float = 1e-8) -> to
     return: same shape, normalized to [0,1] by quantile
     """
     x = x_hw.float()
-    if x.dim() == 3:
-        x_flat = x.reshape(-1)
-    else:
-        x_flat = x.reshape(-1)
+    x_flat = x.reshape(-1)
     scale = torch.quantile(x_flat, q).clamp(min=eps)
     return (x / scale).clamp(0.0, 1.0)
 
@@ -104,21 +101,13 @@ def chroma_edge_weight_map(gt_rgb_3hw: torch.Tensor, edge_quantile: float = 0.99
     gt_rgb_3hw: (3,H,W) in [0,1]
     return: w_hw: (H,W) in [0,1]
     """
-    # chroma = rgb - y
-    y = rgb_to_luma(gt_rgb_3hw)            # (1,H,W)
-    chroma = gt_rgb_3hw - y.repeat(3, 1, 1)  # (3,H,W)
-
-    # sobel grad per channel (6,H,W)
-    g = sobel_grad_3ch(chroma)  # (6,H,W)
-
-    # magnitude across channels and directions
-    # gx/gy per channel -> sqrt(sum(g^2))
-    g2 = (g * g).sum(dim=0)  # (H,W)
-    mag = torch.sqrt(g2 + 1e-8)  # (H,W)
-
-    # robust normalize to [0,1]
+    y = rgb_to_luma(gt_rgb_3hw)                       # (1,H,W)
+    chroma = gt_rgb_3hw - y.repeat(3, 1, 1)           # (3,H,W)
+    g = sobel_grad_3ch(chroma)                        # (6,H,W)
+    g2 = (g * g).sum(dim=0)                           # (H,W)
+    mag = torch.sqrt(g2 + 1e-8)                       # (H,W)
     w = robust_norm01(mag, q=edge_quantile).detach()  # detach: weight is from GT only
-    return w  # (H,W)
+    return w
 
 
 def weighted_l1(pred: torch.Tensor, gt: torch.Tensor, w_hw: torch.Tensor) -> torch.Tensor:
@@ -131,7 +120,6 @@ def weighted_l1(pred: torch.Tensor, gt: torch.Tensor, w_hw: torch.Tensor) -> tor
     assert w_hw.dim() == 2
     w = w_hw.unsqueeze(0)  # (1,H,W)
     err = (pred - gt).abs()
-    # normalize by mean weight to keep scale stable
     denom = w.mean().clamp(min=1e-6)
     return (err * w).mean() / denom
 
@@ -189,9 +177,10 @@ def training(dataset, opt, pipe,
              color_loss: str,
              grad_weight: float,
              chroma_edge_weight: float,
-             edge_quantile: float):
+             edge_quantile: float,
+             expname: str):
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer = prepare_output_and_logger(dataset, expname)
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
@@ -239,14 +228,13 @@ def training(dataset, opt, pipe,
 
         gaussians.update_learning_rate(iteration)
 
-        # Only grow SH when training in RGB (your original intent)
-        
         # some versions do not use much shs
-        # if iteration % 1000 == 0:
-        #     if color_loss == "rgb":
-        #         gaussians.oneupSHdegree()
-        #     elif gaussians.active_sh_degree <= 3:
-        #         gaussians.oneupSHdegree()
+        if iteration % 1000 == 0:
+            if color_loss == "rgb":
+                gaussians.oneupSHdegree()
+            elif gaussians.active_sh_degree <= 3:
+                gaussians.oneupSHdegree()
+
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
@@ -263,9 +251,9 @@ def training(dataset, opt, pipe,
         )
 
         gt_image = viewpoint_cam.original_image.cuda()
-        if gt_image.shape[0] == 1: # actually grayscale
+        if gt_image.shape[0] == 1:  # actually grayscale
             gt_image = gt_image.repeat(3, 1, 1)
-        # clamp for stable loss/grad
+
         image_c = torch.clamp(image, 0.0, 1.0)
         gt_c = torch.clamp(gt_image, 0.0, 1.0)
 
@@ -280,20 +268,17 @@ def training(dataset, opt, pipe,
             pred_y3 = pred_y.repeat(3, 1, 1)
             gt_y3 = gt_y.repeat(3, 1, 1)
 
-            # --- chroma edge weight map (from GT only) ---
             w_edge = None
             if chroma_edge_weight > 0.0:
                 w_edge = chroma_edge_weight_map(gt_c, edge_quantile=edge_quantile)  # (H,W)
-            # L1 on Y (optionally weighted)
+
             if w_edge is None:
                 Ll1 = l1_loss(pred_y3, gt_y3)
             else:
-                # weight Y error on pixels where chroma edges are strong
                 Ll1 = weighted_l1(pred_y3, gt_y3, (1.0 + chroma_edge_weight * w_edge))
 
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(pred_y3, gt_y3))
 
-            # --- gradient loss on Y (Sobel) ---
             if grad_weight > 0.0:
                 gp = sobel_grad_1ch(pred_y)  # (2,H,W)
                 gg = sobel_grad_1ch(gt_y)    # (2,H,W)
@@ -335,7 +320,6 @@ def training(dataset, opt, pipe,
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification (unchanged) — loss weighting/grad will naturally influence the grads used inside stats
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(
                     gaussians.max_radii2D[visibility_filter],
@@ -364,13 +348,46 @@ def training(dataset, opt, pipe,
     save_psnr_curve(psnr_test_records, scene.model_path, tb_writer)
 
 
-def prepare_output_and_logger(args):
+def _sanitize_expname(name: str) -> str:
+    """
+    Keep it filesystem-friendly:
+      - remove leading/trailing spaces
+      - replace path separators/spaces with '_'
+      - keep only [A-Za-z0-9._-]
+    """
+    name = (name or "").strip()
+    if not name:
+        return ""
+    name = name.replace("\\", "_").replace("/", "_").replace(" ", "_")
+    out = []
+    for ch in name:
+        if ch.isalnum() or ch in "._-":
+            out.append(ch)
+        else:
+            out.append("_")
+    # collapse multiple underscores
+    s = "".join(out)
+    while "__" in s:
+        s = s.replace("__", "_")
+    print(f'[INFO] Sanitized expname: "{name}" -> "{s}"')
+    return s.strip("_")
+
+
+def prepare_output_and_logger(args, expname):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str = os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        uid10 = unique_str[0:10]
+
+        exp = _sanitize_expname(expname)
+        if exp:
+            folder = f"{exp}_{uid10}"
+        else:
+            folder = uid10
+
+        args.model_path = os.path.join("./output/", folder)
 
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok=True)
@@ -448,6 +465,13 @@ if __name__ == "__main__":
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
 
+    # NEW: experiment name
+    parser.add_argument(
+        "--expname",
+        type=str,
+        default="",
+        help="Experiment name prefix for output folder (e.g., gray_comp_v1)."
+    )
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
@@ -466,7 +490,6 @@ if __name__ == "__main__":
         help="Training loss computed in RGB or grayscale luma-Y."
     )
 
-    # NEW: gradient loss weight on Y (Sobel)
     parser.add_argument(
         "--grad_weight",
         type=float,
@@ -474,7 +497,6 @@ if __name__ == "__main__":
         help="Add Sobel gradient loss on Y with this weight (useful in gray mode)."
     )
 
-    # NEW: emphasize regions where grayscale loses info (strong chroma edges)
     parser.add_argument(
         "--chroma_edge_weight",
         type=float,
@@ -482,7 +504,6 @@ if __name__ == "__main__":
         help="Reweight Y/grad losses by (1 + chroma_edge_weight * chroma_edge_map)."
     )
 
-    # NEW: robust normalization quantile for edge map
     parser.add_argument(
         "--edge_quantile",
         type=float,
@@ -512,7 +533,8 @@ if __name__ == "__main__":
         args.color_loss,
         args.grad_weight,
         args.chroma_edge_weight,
-        args.edge_quantile
+        args.edge_quantile,
+        args.expname
     )
 
     print("\nTraining complete.")
