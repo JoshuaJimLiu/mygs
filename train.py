@@ -14,6 +14,7 @@ import sys
 import uuid
 import csv
 import torch
+import torch.nn.functional as F
 from random import randint
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
@@ -33,7 +34,7 @@ except ImportError:
 
 
 # ---------------------------
-# Helper: RGB -> Luma (Y) Image.convert() Rev. 601
+# Helper: RGB -> Luma (Y)  (PIL-like weights)
 # ---------------------------
 def rgb_to_luma(rgb_chw: torch.Tensor) -> torch.Tensor:
     """
@@ -46,13 +47,96 @@ def rgb_to_luma(rgb_chw: torch.Tensor) -> torch.Tensor:
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
+# ---------------------------
+# Helper: Sobel gradients
+# ---------------------------
+def sobel_grad_1ch(y_1hw: torch.Tensor) -> torch.Tensor:
+    """
+    y_1hw: (1,H,W)
+    return: (2,H,W) => [gx, gy]
+    """
+    assert y_1hw.dim() == 3 and y_1hw.shape[0] == 1
+    y = y_1hw.unsqueeze(0)  # (N=1,C=1,H,W)
+
+    kx = torch.tensor([[-1, 0, 1],
+                       [-2, 0, 2],
+                       [-1, 0, 1]], dtype=y.dtype, device=y.device).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1, -2, -1],
+                       [ 0,  0,  0],
+                       [ 1,  2,  1]], dtype=y.dtype, device=y.device).view(1, 1, 3, 3)
+
+    gx = F.conv2d(y, kx, padding=1)  # (1,1,H,W)
+    gy = F.conv2d(y, ky, padding=1)  # (1,1,H,W)
+    g = torch.cat([gx, gy], dim=1)   # (1,2,H,W)
+    return g.squeeze(0)              # (2,H,W)
+
+
+def sobel_grad_3ch(rgb_3hw: torch.Tensor) -> torch.Tensor:
+    """
+    rgb_3hw: (3,H,W)
+    return: (6,H,W) => [gx_r,gy_r,gx_g,gy_g,gx_b,gy_b]
+    """
+    assert rgb_3hw.dim() == 3 and rgb_3hw.shape[0] == 3
+    out = []
+    for c in range(3):
+        gc = sobel_grad_1ch(rgb_3hw[c:c+1])
+        out.append(gc)
+    return torch.cat(out, dim=0)  # (6,H,W)
+
+
+def robust_norm01(x_hw: torch.Tensor, q: float = 0.995, eps: float = 1e-8) -> torch.Tensor:
+    """
+    x_hw: (H,W) or (1,H,W)
+    return: same shape, normalized to [0,1] by quantile
+    """
+    x = x_hw.float()
+    if x.dim() == 3:
+        x_flat = x.reshape(-1)
+    else:
+        x_flat = x.reshape(-1)
+    scale = torch.quantile(x_flat, q).clamp(min=eps)
+    return (x / scale).clamp(0.0, 1.0)
+
+
+def chroma_edge_weight_map(gt_rgb_3hw: torch.Tensor, edge_quantile: float = 0.995) -> torch.Tensor:
+    """
+    估计“灰度会丢信息”的区域：chroma 的梯度大（颜色边缘明显）
+    gt_rgb_3hw: (3,H,W) in [0,1]
+    return: w_hw: (H,W) in [0,1]
+    """
+    # chroma = rgb - y
+    y = rgb_to_luma(gt_rgb_3hw)            # (1,H,W)
+    chroma = gt_rgb_3hw - y.repeat(3, 1, 1)  # (3,H,W)
+
+    # sobel grad per channel (6,H,W)
+    g = sobel_grad_3ch(chroma)  # (6,H,W)
+
+    # magnitude across channels and directions
+    # gx/gy per channel -> sqrt(sum(g^2))
+    g2 = (g * g).sum(dim=0)  # (H,W)
+    mag = torch.sqrt(g2 + 1e-8)  # (H,W)
+
+    # robust normalize to [0,1]
+    w = robust_norm01(mag, q=edge_quantile).detach()  # detach: weight is from GT only
+    return w  # (H,W)
+
+
+def weighted_l1(pred: torch.Tensor, gt: torch.Tensor, w_hw: torch.Tensor) -> torch.Tensor:
+    """
+    pred/gt: (C,H,W)
+    w_hw: (H,W) in [0,1]
+    returns weighted mean absolute error
+    """
+    assert pred.shape == gt.shape
+    assert w_hw.dim() == 2
+    w = w_hw.unsqueeze(0)  # (1,H,W)
+    err = (pred - gt).abs()
+    # normalize by mean weight to keep scale stable
+    denom = w.mean().clamp(min=1e-6)
+    return (err * w).mean() / denom
+
+
 def save_psnr_curve(psnr_records, out_dir: str, tb_writer=None):
-    """
-    psnr_records: list of (iteration:int, psnr:float)
-    write:
-      - psnr_test_curve.csv
-      - psnr_test_curve.png
-    """
     if not psnr_records:
         print("[WARN] No PSNR records collected. Skip plotting.")
         return
@@ -66,7 +150,6 @@ def save_psnr_curve(psnr_records, out_dir: str, tb_writer=None):
         for it, v in psnr_records:
             w.writerow([it, float(v)])
 
-    # Plot
     try:
         import matplotlib.pyplot as plt
 
@@ -74,7 +157,7 @@ def save_psnr_curve(psnr_records, out_dir: str, tb_writer=None):
         ys = [v for _, v in psnr_records]
 
         plt.figure()
-        plt.plot(xs, ys)  # don't set colors (use defaults)
+        plt.plot(xs, ys)
         plt.xlabel("Iteration")
         plt.ylabel("PSNR (test)")
         plt.title("Test PSNR vs Iteration")
@@ -87,14 +170,11 @@ def save_psnr_curve(psnr_records, out_dir: str, tb_writer=None):
         print(f"[INFO] Saved PSNR curve CSV: {csv_path}")
         print(f"[INFO] Saved PSNR curve PNG: {png_path}")
 
-        # Optional: log to TensorBoard as image
         if tb_writer is not None:
-            # re-open image and log
             from PIL import Image
             import numpy as np
             img = Image.open(png_path).convert("RGB")
             arr = np.asarray(img).astype("uint8")
-            # TB expects CHW float in [0,1]
             arr_t = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
             tb_writer.add_image("curves/test_psnr_curve", arr_t, global_step=xs[-1])
 
@@ -106,9 +186,11 @@ def save_psnr_curve(psnr_records, out_dir: str, tb_writer=None):
 def training(dataset, opt, pipe,
              testing_iterations, saving_iterations, checkpoint_iterations,
              checkpoint, debug_from,
-             color_loss: str):
+             color_loss: str,
+             grad_weight: float,
+             chroma_edge_weight: float,
+             edge_quantile: float):
     first_iter = 0
-
     tb_writer = prepare_output_and_logger(dataset)
 
     gaussians = GaussianModel(dataset.sh_degree)
@@ -130,10 +212,9 @@ def training(dataset, opt, pipe,
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    # record test PSNR at each test iteration
     psnr_test_records = []
 
-    print(f'color loss mode: {color_loss}')
+    print(f"[INFO] color_loss={color_loss}, grad_weight={grad_weight}, chroma_edge_weight={chroma_edge_weight}, edge_quantile={edge_quantile}")
 
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn is None:
@@ -158,18 +239,21 @@ def training(dataset, opt, pipe,
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
+        # Only grow SH when training in RGB (your original intent)
+        
+        # some versions do not use much shs
         if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
-
-        # Pick a random Camera
+            if color_loss == "rgb":
+                gaussians.oneupSHdegree()
+            elif gaussians.active_sh_degree <= 3:
+                gaussians.oneupSHdegree()
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
-        # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = (
             render_pkg["render"],
@@ -178,30 +262,58 @@ def training(dataset, opt, pipe,
             render_pkg["radii"]
         )
 
-        # Loss
         gt_image = viewpoint_cam.original_image.cuda()
 
-        if color_loss == "rgb":
-            Ll1 = l1_loss(image, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        elif color_loss == "gray":
-            # compute luma, then repeat to 3 channels for SSIM safety
-            pred_y = rgb_to_luma(torch.clamp(image, 0.0, 1.0))         # (1,H,W)
-            gt_y = rgb_to_luma(torch.clamp(gt_image, 0.0, 1.0))        # (1,H,W)
-            pred_y3 = pred_y.repeat(3, 1, 1)                           # (3,H,W)
-            gt_y3 = gt_y.repeat(3, 1, 1)                               # (3,H,W)
+        # clamp for stable loss/grad
+        image_c = torch.clamp(image, 0.0, 1.0)
+        gt_c = torch.clamp(gt_image, 0.0, 1.0)
 
-            Ll1 = l1_loss(pred_y3, gt_y3)
+        if color_loss == "rgb":
+            Ll1 = l1_loss(image_c, gt_c)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image_c, gt_c))
+
+        elif color_loss == "gray":
+            pred_y = rgb_to_luma(image_c)   # (1,H,W)
+            gt_y = rgb_to_luma(gt_c)        # (1,H,W)
+
+            pred_y3 = pred_y.repeat(3, 1, 1)
+            gt_y3 = gt_y.repeat(3, 1, 1)
+
+            # --- chroma edge weight map (from GT only) ---
+            w_edge = None
+            if chroma_edge_weight > 0.0:
+                w_edge = chroma_edge_weight_map(gt_c, edge_quantile=edge_quantile)  # (H,W)
+            # L1 on Y (optionally weighted)
+            if w_edge is None:
+                Ll1 = l1_loss(pred_y3, gt_y3)
+            else:
+                # weight Y error on pixels where chroma edges are strong
+                Ll1 = weighted_l1(pred_y3, gt_y3, (1.0 + chroma_edge_weight * w_edge))
+
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(pred_y3, gt_y3))
+
+            # --- gradient loss on Y (Sobel) ---
+            if grad_weight > 0.0:
+                gp = sobel_grad_1ch(pred_y)  # (2,H,W)
+                gg = sobel_grad_1ch(gt_y)    # (2,H,W)
+                diff = (gp - gg).abs()       # (2,H,W)
+
+                if w_edge is None:
+                    loss_g = diff.mean()
+                else:
+                    w = (1.0 + chroma_edge_weight * w_edge).unsqueeze(0)  # (1,H,W)
+                    denom = w.mean().clamp(min=1e-6)
+                    loss_g = (diff * w).mean() / denom
+
+                loss = loss + grad_weight * loss_g
+
         else:
             raise ValueError(f"Unknown color_loss: {color_loss}")
 
         loss.backward()
-
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}, color loss: {color_loss}"})
@@ -209,7 +321,6 @@ def training(dataset, opt, pipe,
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
             training_report(
                 tb_writer, iteration, Ll1, loss, l1_loss,
                 iter_start.elapsed_time(iter_end),
@@ -223,7 +334,7 @@ def training(dataset, opt, pipe,
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
+            # Densification (unchanged) — loss weighting/grad will naturally influence the grads used inside stats
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(
                     gaussians.max_radii2D[visibility_filter],
@@ -238,7 +349,6 @@ def training(dataset, opt, pipe,
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
@@ -250,7 +360,6 @@ def training(dataset, opt, pipe,
                     scene.model_path + "/chkpnt" + str(iteration) + ".pth"
                 )
 
-    # After training: save curve
     save_psnr_curve(psnr_test_records, scene.model_path, tb_writer)
 
 
@@ -283,7 +392,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed,
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
-    # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = (
@@ -294,7 +402,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed,
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
-                psnr_test = 0.0
+                psnr_test_val = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -313,20 +421,19 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed,
                             )
 
                     l1_test += l1_loss_fn(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    psnr_test_val += psnr(image, gt_image).mean().double()
 
-                psnr_test /= len(config['cameras'])
+                psnr_test_val /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
 
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test_val))
 
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test_val, iteration)
 
-                # record test PSNR curve
                 if config['name'] == 'test':
-                    psnr_test_records.append((int(iteration), float(psnr_test)))
+                    psnr_test_records.append((int(iteration), float(psnr_test_val)))
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
@@ -350,13 +457,36 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
 
-    # NEW: RGB vs Gray training loss switch
     parser.add_argument(
         "--color_loss",
         type=str,
         choices=["rgb", "gray"],
         default="gray",
-        help="Training loss computed in RGB (default) or grayscale luma-Y."
+        help="Training loss computed in RGB or grayscale luma-Y."
+    )
+
+    # NEW: gradient loss weight on Y (Sobel)
+    parser.add_argument(
+        "--grad_weight",
+        type=float,
+        default=0.0,
+        help="Add Sobel gradient loss on Y with this weight (useful in gray mode)."
+    )
+
+    # NEW: emphasize regions where grayscale loses info (strong chroma edges)
+    parser.add_argument(
+        "--chroma_edge_weight",
+        type=float,
+        default=0.0,
+        help="Reweight Y/grad losses by (1 + chroma_edge_weight * chroma_edge_map)."
+    )
+
+    # NEW: robust normalization quantile for edge map
+    parser.add_argument(
+        "--edge_quantile",
+        type=float,
+        default=0.995,
+        help="Quantile used to normalize chroma edge magnitude to [0,1]."
     )
 
     args = parser.parse_args(sys.argv[1:])
@@ -366,7 +496,6 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
 
     safe_state(args.quiet)
-
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
@@ -379,7 +508,10 @@ if __name__ == "__main__":
         args.checkpoint_iterations,
         args.start_checkpoint,
         args.debug_from,
-        args.color_loss
+        args.color_loss,
+        args.grad_weight,
+        args.chroma_edge_weight,
+        args.edge_quantile
     )
 
     print("\nTraining complete.")
