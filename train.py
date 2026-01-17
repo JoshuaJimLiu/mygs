@@ -242,11 +242,11 @@ def training(dataset, opt, pipe,
         # Only grow SH when training in RGB (your original intent)
         
         # some versions do not use much shs
-        if iteration % 1000 == 0:
-            if color_loss == "rgb":
-                gaussians.oneupSHdegree()
-            elif gaussians.active_sh_degree <= 3:
-                gaussians.oneupSHdegree()
+        # if iteration % 1000 == 0:
+        #     if color_loss == "rgb":
+        #         gaussians.oneupSHdegree()
+        #     elif gaussians.active_sh_degree <= 3:
+        #         gaussians.oneupSHdegree()
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
@@ -263,7 +263,8 @@ def training(dataset, opt, pipe,
         )
 
         gt_image = viewpoint_cam.original_image.cuda()
-
+        if gt_image.shape[0] == 1: # actually grayscale
+            gt_image = gt_image.repeat(3, 1, 1)
         # clamp for stable loss/grad
         image_c = torch.clamp(image, 0.0, 1.0)
         gt_c = torch.clamp(gt_image, 0.0, 1.0)

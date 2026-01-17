@@ -8,6 +8,7 @@ tensorboard_3d
 screenshots
 
 data/*
+dataGray/*
 
 *.zip
 
