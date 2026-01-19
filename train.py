@@ -1,3 +1,4 @@
+# train.py
 #
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
@@ -14,7 +15,6 @@ import sys
 import uuid
 import csv
 import torch
-import torch.nn.functional as F
 from random import randint
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
@@ -33,13 +33,13 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
-# ---------------------------
-# Helper: RGB -> Luma (Y)  (PIL-like weights)
-# ---------------------------
+# ==============================================================================
+# Color helpers
+# ==============================================================================
 def rgb_to_luma(rgb_chw: torch.Tensor) -> torch.Tensor:
     """
     rgb_chw: (3,H,W) in [0,1]
-    return:  (1,H,W) luma
+    return:  (1,H,W) luma (PIL-like weights)
     """
     r = rgb_chw[0:1]
     g = rgb_chw[1:2]
@@ -47,83 +47,51 @@ def rgb_to_luma(rgb_chw: torch.Tensor) -> torch.Tensor:
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
-# ---------------------------
-# Helper: Sobel gradients
-# ---------------------------
-def sobel_grad_1ch(y_1hw: torch.Tensor) -> torch.Tensor:
+def _sanitize_expname(name: str) -> str:
     """
-    y_1hw: (1,H,W)
-    return: (2,H,W) => [gx, gy]
+    Filesystem-friendly experiment name.
+      - strip
+      - replace separators/spaces with '_'
+      - keep only [A-Za-z0-9._-], others -> '_'
+      - collapse multiple '_'
+      - strip leading/trailing '_'
     """
-    assert y_1hw.dim() == 3 and y_1hw.shape[0] == 1
-    y = y_1hw.unsqueeze(0)  # (N=1,C=1,H,W)
-
-    kx = torch.tensor([[-1, 0, 1],
-                       [-2, 0, 2],
-                       [-1, 0, 1]], dtype=y.dtype, device=y.device).view(1, 1, 3, 3)
-    ky = torch.tensor([[-1, -2, -1],
-                       [0, 0, 0],
-                       [1, 2, 1]], dtype=y.dtype, device=y.device).view(1, 1, 3, 3)
-
-    gx = F.conv2d(y, kx, padding=1)  # (1,1,H,W)
-    gy = F.conv2d(y, ky, padding=1)  # (1,1,H,W)
-    g = torch.cat([gx, gy], dim=1)   # (1,2,H,W)
-    return g.squeeze(0)              # (2,H,W)
-
-
-def sobel_grad_3ch(rgb_3hw: torch.Tensor) -> torch.Tensor:
-    """
-    rgb_3hw: (3,H,W)
-    return: (6,H,W) => [gx_r,gy_r,gx_g,gy_g,gx_b,gy_b]
-    """
-    assert rgb_3hw.dim() == 3 and rgb_3hw.shape[0] == 3
+    name = (name or "").strip()
+    if not name:
+        return ""
+    name = name.replace("\\", "_").replace("/", "_").replace(" ", "_")
     out = []
-    for c in range(3):
-        gc = sobel_grad_1ch(rgb_3hw[c:c + 1])
-        out.append(gc)
-    return torch.cat(out, dim=0)  # (6,H,W)
+    for ch in name:
+        if ch.isalnum() or ch in "._-":
+            out.append(ch)
+        else:
+            out.append("_")
+    s = "".join(out)
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
 
 
-def robust_norm01(x_hw: torch.Tensor, q: float = 0.995, eps: float = 1e-8) -> torch.Tensor:
+def resolve_model_path(args):
     """
-    x_hw: (H,W) or (1,H,W)
-    return: same shape, normalized to [0,1] by quantile
+    Make expname *actually* affect the output folder by resolving args.model_path
+    BEFORE ModelParams.extract() (so dataset.model_path also picks it up).
     """
-    x = x_hw.float()
-    x_flat = x.reshape(-1)
-    scale = torch.quantile(x_flat, q).clamp(min=eps)
-    return (x / scale).clamp(0.0, 1.0)
+    if getattr(args, "model_path", ""):
+        # user already specified --model_path, don't override
+        return
+
+    unique_str = os.getenv("OAR_JOB_ID") or str(uuid.uuid4())
+    uid10 = unique_str[:10]
+
+    exp = _sanitize_expname(getattr(args, "expname", ""))
+    folder = f"{exp}_{uid10}" if exp else uid10
+    args.model_path = os.path.join("./output", folder)
 
 
-def chroma_edge_weight_map(gt_rgb_3hw: torch.Tensor, edge_quantile: float = 0.995) -> torch.Tensor:
-    """
-    估计“灰度会丢信息”的区域：chroma 的梯度大（颜色边缘明显）
-    gt_rgb_3hw: (3,H,W) in [0,1]
-    return: w_hw: (H,W) in [0,1]
-    """
-    y = rgb_to_luma(gt_rgb_3hw)                       # (1,H,W)
-    chroma = gt_rgb_3hw - y.repeat(3, 1, 1)           # (3,H,W)
-    g = sobel_grad_3ch(chroma)                        # (6,H,W)
-    g2 = (g * g).sum(dim=0)                           # (H,W)
-    mag = torch.sqrt(g2 + 1e-8)                       # (H,W)
-    w = robust_norm01(mag, q=edge_quantile).detach()  # detach: weight is from GT only
-    return w
-
-
-def weighted_l1(pred: torch.Tensor, gt: torch.Tensor, w_hw: torch.Tensor) -> torch.Tensor:
-    """
-    pred/gt: (C,H,W)
-    w_hw: (H,W) in [0,1]
-    returns weighted mean absolute error
-    """
-    assert pred.shape == gt.shape
-    assert w_hw.dim() == 2
-    w = w_hw.unsqueeze(0)  # (1,H,W)
-    err = (pred - gt).abs()
-    denom = w.mean().clamp(min=1e-6)
-    return (err * w).mean() / denom
-
-
+# ==============================================================================
+# Logging / PSNR curve
+# ==============================================================================
 def save_psnr_curve(psnr_records, out_dir: str, tb_writer=None):
     if not psnr_records:
         print("[WARN] No PSNR records collected. Skip plotting.")
@@ -136,7 +104,7 @@ def save_psnr_curve(psnr_records, out_dir: str, tb_writer=None):
         w = csv.writer(f)
         w.writerow(["iteration", "psnr"])
         for it, v in psnr_records:
-            w.writerow([it, float(v)])
+            w.writerow([int(it), float(v)])
 
     try:
         import matplotlib.pyplot as plt
@@ -171,16 +139,149 @@ def save_psnr_curve(psnr_records, out_dir: str, tb_writer=None):
         print(f"[INFO] But CSV has been saved: {csv_path}")
 
 
-def training(dataset, opt, pipe,
-             testing_iterations, saving_iterations, checkpoint_iterations,
-             checkpoint, debug_from,
-             color_loss: str,
-             grad_weight: float,
-             chroma_edge_weight: float,
-             edge_quantile: float,
-             expname: str):
+def prepare_output_and_logger(dataset):
+    print("Output folder:", dataset.model_path)
+    os.makedirs(dataset.model_path, exist_ok=True)
+    with open(os.path.join(dataset.model_path, "cfg_args"), "w", encoding="utf-8") as f:
+        f.write(str(Namespace(**vars(dataset))))
+
+    tb_writer = None
+    if TENSORBOARD_FOUND:
+        tb_writer = SummaryWriter(dataset.model_path)
+    else:
+        print("Tensorboard not available: not logging progress")
+    return tb_writer
+
+
+# ==============================================================================
+# Stage-2 stabilization helpers
+# ==============================================================================
+@torch.no_grad()
+def project_sh_to_gray(gaussians: GaussianModel):
+    """
+    Make SH colors grayscale (R=G=B) by averaging RGB channels per coeff.
+    Helps reduce chroma shock when switching to RGB loss.
+    """
+    if hasattr(gaussians, "_features_dc") and gaussians._features_dc.numel() > 0:
+        dc = gaussians._features_dc.data
+        m = dc.mean(dim=-1, keepdim=True)
+        dc.copy_(m.expand_as(dc))
+
+    if hasattr(gaussians, "_features_rest") and gaussians._features_rest.numel() > 0:
+        rst = gaussians._features_rest.data
+        m = rst.mean(dim=-1, keepdim=True)
+        rst.copy_(m.expand_as(rst))
+
+
+def setup_stage2_optimizer(
+    gaussians: GaussianModel,
+    opt,
+    feature_lr_scale: float = 0.1,
+    do_project_gray: bool = True,
+    train_opacity: bool = False,
+    opacity_lr_scale: float = 0.1,
+):
+    """
+    Stage-2: freeze geometry (xyz/scale/rot), train SH (and optionally opacity).
+    Recreate optimizer from scratch (clears Adam moments).
+    """
+    if do_project_gray:
+        project_sh_to_gray(gaussians)
+
+    # Freeze geometry
+    gaussians._xyz.requires_grad_(False)
+    gaussians._scaling.requires_grad_(False)
+    gaussians._rotation.requires_grad_(False)
+
+    # Opacity: optional
+    gaussians._opacity.requires_grad_(bool(train_opacity))
+
+    # Train SH parameters
+    gaussians._features_dc.requires_grad_(True)
+    gaussians._features_rest.requires_grad_(True)
+
+    lr_dc = float(opt.feature_lr) * float(feature_lr_scale)
+    lr_rest = float(opt.feature_lr / 20.0) * float(feature_lr_scale)
+
+    param_groups = [
+        {"params": [gaussians._features_dc], "lr": lr_dc, "base_lr": lr_dc, "name": "f_dc"},
+        {"params": [gaussians._features_rest], "lr": lr_rest, "base_lr": lr_rest, "name": "f_rest"},
+    ]
+
+    if train_opacity:
+        lr_op = float(opt.opacity_lr) * float(opacity_lr_scale)
+        param_groups.append({"params": [gaussians._opacity], "lr": lr_op, "base_lr": lr_op, "name": "opacity"})
+
+    gaussians.optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+
+    print(
+        f"[STAGE2] Recreated optimizer: "
+        f"lr_dc={lr_dc:g}, lr_rest={lr_rest:g}, "
+        f"train_opacity={train_opacity}, opacity_lr={float(opt.opacity_lr) * float(opacity_lr_scale):g}, "
+        f"project_gray={do_project_gray}"
+    )
+
+
+def stage2_apply_warmup_lr(gaussians: GaussianModel, warmup_iters: int, t: int):
+    """
+    Linear warmup for stage2 learning rate (per param group).
+    IMPORTANT: uses stored 'base_lr' to avoid the common bug of shrinking LR repeatedly.
+    """
+    if warmup_iters <= 0:
+        return
+    w = min(1.0, max(0.0, (t + 1) / float(warmup_iters)))
+    for g in gaussians.optimizer.param_groups:
+        base_lr = float(g.get("base_lr", g["lr"]))
+        g["lr"] = base_lr * w
+
+
+# ==============================================================================
+# Losses
+# ==============================================================================
+def compute_rgb_loss(image_c, gt_c, opt):
+    Ll1 = l1_loss(image_c, gt_c)
+    return (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image_c, gt_c)), Ll1
+
+
+def compute_gray_loss_equiv(image_c, gt_c, opt):
+    """
+    Gray loss (luma) computed from RGB images.
+    Returns total_loss, Ll1(gray)
+    """
+    pred_y = rgb_to_luma(image_c)  # (1,H,W)
+    gt_y = rgb_to_luma(gt_c)       # (1,H,W)
+    pred_y3 = pred_y.repeat(3, 1, 1)
+    gt_y3 = gt_y.repeat(3, 1, 1)
+    Ll1 = l1_loss(pred_y3, gt_y3)
+    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(pred_y3, gt_y3))
+    return loss, Ll1
+
+
+# ==============================================================================
+# Training
+# ==============================================================================
+def training(
+    dataset, opt, pipe,
+    testing_iterations, saving_iterations, checkpoint_iterations,
+    checkpoint, debug_from,
+    color_loss: str,
+    two_stage: bool,
+    rgb_finetune_iters: int,
+    stage2_feature_lr_scale: float,
+    stage2_warmup_iters: int,
+    stage2_project_gray: bool,
+    stage2_only: bool,
+    stage2_train_opacity: bool,
+    stage2_opacity_lr_scale: float,
+):
+    """
+    Modes:
+      1) single-stage: --color_loss {rgb,gray}
+      2) --two_stage: gray-loss first, then RGB-loss for last --rgb_finetune_iters
+      3) --stage2_only: start directly in stage2 (use with --start_checkpoint)
+    """
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset, expname)
+    tb_writer = prepare_output_and_logger(dataset)
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
@@ -189,6 +290,7 @@ def training(dataset, opt, pipe,
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+        print(f"[INFO] Restored checkpoint: {checkpoint}, first_iter={first_iter}")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -203,9 +305,48 @@ def training(dataset, opt, pipe,
 
     psnr_test_records = []
 
-    print(f"[INFO] color_loss={color_loss}, grad_weight={grad_weight}, chroma_edge_weight={chroma_edge_weight}, edge_quantile={edge_quantile}")
+    rgb_finetune_iters = max(0, int(rgb_finetune_iters))
+    if two_stage:
+        if rgb_finetune_iters <= 0 or rgb_finetune_iters >= opt.iterations:
+            print("[WARN] two_stage enabled but rgb_finetune_iters invalid; falling back to single-stage rgb.")
+            two_stage = False
+            stage2_start_iter = None
+        else:
+            stage2_start_iter = opt.iterations - rgb_finetune_iters + 1  # 1-based
+    else:
+        stage2_start_iter = None
 
+    stage2_initialized = False
+    if stage2_only:
+        stage2_start_iter = first_iter
+
+    print(
+        f"[INFO] mode: "
+        f"{'stage2_only' if stage2_only else ('two_stage' if two_stage else 'single_stage')}, "
+        f"color_loss(single)={color_loss}, rgb_finetune_iters={rgb_finetune_iters}, "
+        f"stage2_lr_scale={stage2_feature_lr_scale}, stage2_warmup_iters={stage2_warmup_iters}, "
+        f"stage2_project_gray={stage2_project_gray}, "
+        f"stage2_train_opacity={stage2_train_opacity}, stage2_opacity_lr_scale={stage2_opacity_lr_scale}"
+    )
     for iteration in range(first_iter, opt.iterations + 1):
+        # Stage selection
+        if stage2_start_iter is not None and iteration >= stage2_start_iter:
+            cur_stage = "rgb"
+        else:
+            cur_stage = "gray" if two_stage else color_loss
+
+        # Stage2 init (once)
+        if (stage2_start_iter is not None) and (iteration == stage2_start_iter) and (not stage2_initialized):
+            setup_stage2_optimizer(
+                gaussians, opt,
+                feature_lr_scale=stage2_feature_lr_scale,
+                do_project_gray=stage2_project_gray,
+                train_opacity=stage2_train_opacity,
+                opacity_lr_scale=stage2_opacity_lr_scale,
+            )
+            stage2_initialized = True
+
+        # GUI
         if network_gui.conn is None:
             network_gui.try_connect()
         while network_gui.conn is not None:
@@ -226,22 +367,21 @@ def training(dataset, opt, pipe,
 
         iter_start.record()
 
+        # LR schedule for xyz group (only meaningful when xyz is in optimizer)
         gaussians.update_learning_rate(iteration)
 
-        # some versions do not use much shs
+        # SH degree schedule
         if iteration % 1000 == 0:
-            if color_loss == "rgb":
-                gaussians.oneupSHdegree()
-            elif gaussians.active_sh_degree <= 3:
-                gaussians.oneupSHdegree()
+            gaussians.oneupSHdegree()
 
+        # Pick a random camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
+        # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = (
             render_pkg["render"],
@@ -250,59 +390,45 @@ def training(dataset, opt, pipe,
             render_pkg["radii"]
         )
 
+        # GT
         gt_image = viewpoint_cam.original_image.cuda()
-        if gt_image.shape[0] == 1:  # actually grayscale
+        if gt_image.shape[0] == 1:
             gt_image = gt_image.repeat(3, 1, 1)
 
         image_c = torch.clamp(image, 0.0, 1.0)
         gt_c = torch.clamp(gt_image, 0.0, 1.0)
 
-        if color_loss == "rgb":
-            Ll1 = l1_loss(image_c, gt_c)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image_c, gt_c))
+        # Loss
+        if cur_stage == "rgb":
+            loss, Ll1 = compute_rgb_loss(image_c, gt_c, opt)
 
-        elif color_loss == "gray":
-            pred_y = rgb_to_luma(image_c)   # (1,H,W)
-            gt_y = rgb_to_luma(gt_c)        # (1,H,W)
-
-            pred_y3 = pred_y.repeat(3, 1, 1)
-            gt_y3 = gt_y.repeat(3, 1, 1)
-
-            w_edge = None
-            if chroma_edge_weight > 0.0:
-                w_edge = chroma_edge_weight_map(gt_c, edge_quantile=edge_quantile)  # (H,W)
-
-            if w_edge is None:
-                Ll1 = l1_loss(pred_y3, gt_y3)
-            else:
-                Ll1 = weighted_l1(pred_y3, gt_y3, (1.0 + chroma_edge_weight * w_edge))
-
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(pred_y3, gt_y3))
-
-            if grad_weight > 0.0:
-                gp = sobel_grad_1ch(pred_y)  # (2,H,W)
-                gg = sobel_grad_1ch(gt_y)    # (2,H,W)
-                diff = (gp - gg).abs()       # (2,H,W)
-
-                if w_edge is None:
-                    loss_g = diff.mean()
-                else:
-                    w = (1.0 + chroma_edge_weight * w_edge).unsqueeze(0)  # (1,H,W)
-                    denom = w.mean().clamp(min=1e-6)
-                    loss_g = (diff * w).mean() / denom
-
-                loss = loss + grad_weight * loss_g
-
+            if (stage2_start_iter is not None) and (iteration == stage2_start_iter):
+                gray_loss_equiv, gray_l1 = compute_gray_loss_equiv(image_c, gt_c, opt)
+                print(
+                    f"[STAGE2-DEBUG @iter {iteration}] "
+                    f"gray_equiv_loss={float(gray_loss_equiv):.6f} (L1y={float(gray_l1):.6f}), "
+                    f"rgb_loss={float(loss):.6f} (L1rgb={float(Ll1):.6f}), "
+                    f"pred[min,max]=({float(image_c.min()):.4f},{float(image_c.max()):.4f}), "
+                    f"gt[min,max]=({float(gt_c.min()):.4f},{float(gt_c.max()):.4f})"
+                )
+        elif cur_stage == "gray":
+            loss, Ll1 = compute_gray_loss_equiv(image_c, gt_c, opt)
         else:
-            raise ValueError(f"Unknown color_loss: {color_loss}")
+            raise ValueError(f"Unknown stage/loss mode: {cur_stage}")
 
         loss.backward()
         iter_end.record()
 
         with torch.no_grad():
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            # Stage2 warmup
+            in_stage2 = stage2_initialized and (stage2_start_iter is not None) and (iteration >= stage2_start_iter)
+            if in_stage2:
+                t2 = iteration - stage2_start_iter  # 0-based
+                stage2_apply_warmup_lr(gaussians, warmup_iters=stage2_warmup_iters, t=t2)
+
+            ema_loss_for_log = 0.4 * float(loss.item()) + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}, color loss: {color_loss}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.7f}", "stage": cur_stage})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -317,10 +443,11 @@ def training(dataset, opt, pipe,
             )
 
             if iteration in saving_iterations:
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
-            if iteration < opt.densify_until_iter:
+            # Densification: disable in stage2 (features/opacity-only finetune)
+            if (not in_stage2) and (iteration < opt.densify_until_iter):
                 gaussians.max_radii2D[visibility_filter] = torch.max(
                     gaussians.max_radii2D[visibility_filter],
                     radii[visibility_filter]
@@ -339,7 +466,7 @@ def training(dataset, opt, pipe,
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
             if iteration in checkpoint_iterations:
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                print(f"\n[ITER {iteration}] Saving Checkpoint")
                 torch.save(
                     (gaussians.capture(), iteration),
                     scene.model_path + "/chkpnt" + str(iteration) + ".pth"
@@ -348,67 +475,13 @@ def training(dataset, opt, pipe,
     save_psnr_curve(psnr_test_records, scene.model_path, tb_writer)
 
 
-def _sanitize_expname(name: str) -> str:
-    """
-    Keep it filesystem-friendly:
-      - remove leading/trailing spaces
-      - replace path separators/spaces with '_'
-      - keep only [A-Za-z0-9._-]
-    """
-    name = (name or "").strip()
-    if not name:
-        return ""
-    name = name.replace("\\", "_").replace("/", "_").replace(" ", "_")
-    out = []
-    for ch in name:
-        if ch.isalnum() or ch in "._-":
-            out.append(ch)
-        else:
-            out.append("_")
-    # collapse multiple underscores
-    s = "".join(out)
-    while "__" in s:
-        s = s.replace("__", "_")
-    print(f'[INFO] Sanitized expname: "{name}" -> "{s}"')
-    return s.strip("_")
-
-
-def prepare_output_and_logger(args, expname):
-    if not args.model_path:
-        if os.getenv('OAR_JOB_ID'):
-            unique_str = os.getenv('OAR_JOB_ID')
-        else:
-            unique_str = str(uuid.uuid4())
-        uid10 = unique_str[0:10]
-
-        exp = _sanitize_expname(expname)
-        if exp:
-            folder = f"{exp}_{uid10}"
-        else:
-            folder = uid10
-
-        args.model_path = os.path.join("./output/", folder)
-
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok=True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
-
-    tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
-    return tb_writer
-
-
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed,
                     testing_iterations, scene: Scene, renderFunc, renderArgs,
                     psnr_test_records):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
+        tb_writer.add_scalar('train_loss_patches/l1_loss', float(Ll1.item()), iteration)
+        tb_writer.add_scalar('train_loss_patches/total_loss', float(loss.item()), iteration)
+        tb_writer.add_scalar('iter_time', float(elapsed), iteration)
 
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
@@ -424,6 +497,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed,
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    if gt_image.shape[0] == 1:
+                        gt_image = gt_image.repeat(3, 1, 1)
 
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(
@@ -444,7 +519,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed,
                 psnr_test_val /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
 
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test_val))
+                print(f"\n[ITER {iteration}] Evaluating {config['name']}: L1 {l1_test} PSNR {psnr_test_val}")
 
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
@@ -465,13 +540,35 @@ if __name__ == "__main__":
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
 
-    # NEW: experiment name
-    parser.add_argument(
-        "--expname",
-        type=str,
-        default="",
-        help="Experiment name prefix for output folder (e.g., gray_comp_v1)."
-    )
+    parser.add_argument("--expname", type=str, default="",
+                        help="Experiment name prefix for output folder (e.g., grayAsRGB_SH_room1).")
+
+    # Two-stage controls
+    parser.add_argument("--two_stage", action="store_true",
+                        help="Run gray-loss first, then RGB-loss for the last --rgb_finetune_iters.")
+    parser.add_argument("--rgb_finetune_iters", type=int, default=1000,
+                        help="Number of final iterations to finetune with RGB loss in two-stage mode.")
+    parser.add_argument("--stage2_only", action="store_true",
+                        help="Do only 'RGB finetune' mode from the beginning (use with --start_checkpoint). "
+                             "This recreates optimizer and trains SH (and optional opacity) only.")
+    parser.add_argument("--stage2_feature_lr_scale", type=float, default=0.1,
+                        help="Stage2 feature LR = original feature_lr * this scale (default 0.1).")
+    parser.add_argument("--stage2_warmup_iters", type=int, default=100,
+                        help="Warmup iterations for stage2 LR (0 disables).")
+    parser.add_argument("--stage2_project_gray", action="store_true",
+                        help="Before stage2, project SH colors to grayscale (R=G=B) to reduce loss spike.")
+
+    # NEW: stage2 train opacity
+    parser.add_argument("--stage2_train_opacity", action="store_true",
+                        help="In stage2, also train opacity (often helps prevent RGB finetune from flying).")
+    parser.add_argument("--stage2_opacity_lr_scale", type=float, default=0.2,
+                        help="Stage2 opacity LR = original opacity_lr * this scale (default 0.2).")
+
+    # Single-stage fallback
+    parser.add_argument("--color_loss", type=str, choices=["rgb", "gray"], default="rgb",
+                        help="Single-stage training loss: RGB or gray(luma). Ignored in --two_stage/--stage2_only.")
+
+    # Other original args
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
@@ -482,59 +579,41 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
 
-    parser.add_argument(
-        "--color_loss",
-        type=str,
-        choices=["rgb", "gray"],
-        default="gray",
-        help="Training loss computed in RGB or grayscale luma-Y."
-    )
-
-    parser.add_argument(
-        "--grad_weight",
-        type=float,
-        default=0.0,
-        help="Add Sobel gradient loss on Y with this weight (useful in gray mode)."
-    )
-
-    parser.add_argument(
-        "--chroma_edge_weight",
-        type=float,
-        default=0.0,
-        help="Reweight Y/grad losses by (1 + chroma_edge_weight * chroma_edge_map)."
-    )
-
-    parser.add_argument(
-        "--edge_quantile",
-        type=float,
-        default=0.995,
-        help="Quantile used to normalize chroma edge magnitude to [0,1]."
-    )
-
     args = parser.parse_args(sys.argv[1:])
+
+    resolve_model_path(args)
+
     args.save_iterations.append(args.iterations)
+    test_iterations = [x for x in range(0, args.iterations + 1, 500)]
 
-    test_iterations = [x for x in range(0, args.iterations + 1, 1000)]
-    print("Optimizing " + args.model_path)
-
+    print("Optimizing " + str(args.model_path))
     safe_state(args.quiet)
+
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
+    dataset = lp.extract(args)
+    opt = op.extract(args)
+    pipe = pp.extract(args)
+
     training(
-        lp.extract(args),
-        op.extract(args),
-        pp.extract(args),
+        dataset,
+        opt,
+        pipe,
         test_iterations,
         args.save_iterations,
         args.checkpoint_iterations,
         args.start_checkpoint,
         args.debug_from,
         args.color_loss,
-        args.grad_weight,
-        args.chroma_edge_weight,
-        args.edge_quantile,
-        args.expname
+        args.two_stage,
+        args.rgb_finetune_iters,
+        args.stage2_feature_lr_scale,
+        args.stage2_warmup_iters,
+        args.stage2_project_gray,
+        args.stage2_only,
+        args.stage2_train_opacity,
+        args.stage2_opacity_lr_scale,
     )
 
     print("\nTraining complete.")
