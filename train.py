@@ -165,8 +165,6 @@ def prepare_output_and_logger(dataset):
         f.write(str(Namespace(**vars(dataset))))
 
     tb_writer = None
-
-
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(dataset.model_path)
     else:
@@ -186,60 +184,91 @@ def setup_stage2_optimizer(
     force_dc_sh: bool = False,
 ):
     """
-    Stage-2: freeze geometry (xyz/scale/rot), train SH (and optionally opacity).
-    Recreate optimizer from scratch (clears Adam moments).
-    NOTE: loss is still RGB loss (no gray/luma conversion here).
+    Stage-2: recreate optimizer from scratch (clears Adam moments) BUT KEEP ALL param groups
+    (xyz/scaling/rotation/opacity/f_dc/f_rest...) so densify/prune won't crash.
+
+    Strategy:
+      1) call gaussians.training_setup(opt) to build the original optimizer (all groups exist)
+      2) freeze geometry grads by default + set geometry lrs to 0 (will be restored after warmup if enabled)
+      3) scale SH lrs; opacity lr depends on train_opacity flag
     """
-    # Freeze geometry
+    # (1) rebuild the default optimizer so param groups are complete (fix "missing xyz")
+    gaussians.training_setup(opt)
+
+    # make sure every group has base_lr for later restore / warmup
+    for g in gaussians.optimizer.param_groups:
+        if "base_lr" not in g:
+            g["base_lr"] = float(g.get("lr", 0.0))
+
+    # (2) freeze geometry grads by default
     gaussians._xyz.requires_grad_(False)
     gaussians._scaling.requires_grad_(False)
     gaussians._rotation.requires_grad_(False)
 
-    # Opacity: optional
-    gaussians._opacity.requires_grad_(bool(train_opacity))
-
-    # Train SH parameters (but if force_dc_sh: only train DC, freeze rest)
+    # (3) SH grads
     gaussians._features_dc.requires_grad_(True)
     if hasattr(gaussians, "_features_rest") and gaussians._features_rest is not None:
         gaussians._features_rest.requires_grad_(not force_dc_sh)
 
-    lr_dc = float(opt.feature_lr) * float(feature_lr_scale)
-    lr_rest = float(opt.feature_lr / 20.0) * float(feature_lr_scale)
+    # opacity grads
+    gaussians._opacity.requires_grad_(bool(train_opacity))
 
-    param_groups = [
-        {"params": [gaussians._features_dc], "lr": lr_dc, "base_lr": lr_dc, "name": "f_dc"},
-    ]
+    # adjust lrs by group name (names follow the official repo: xyz, f_dc, f_rest, opacity, scaling, rotation)
+    for g in gaussians.optimizer.param_groups:
+        name = g.get("name", "")
 
-    if (not force_dc_sh) and hasattr(gaussians, "_features_rest") and gaussians._features_rest is not None:
-        param_groups.append(
-            {"params": [gaussians._features_rest], "lr": lr_rest, "base_lr": lr_rest, "name": "f_rest"}
-        )
+        # geometry groups: keep base_lr but start with lr=0 (warmup phase frozen)
+        if name in ("xyz", "scaling", "rotation"):
+            # base_lr already stored above (original lr)
+            g["lr"] = 0.0
+            continue
 
-    if train_opacity:
-        lr_op = float(opt.opacity_lr) * float(opacity_lr_scale)
-        param_groups.append({"params": [gaussians._opacity], "lr": lr_op, "base_lr": lr_op, "name": "opacity"})
+        # SH groups: scale
+        if name == "f_dc":
+            g["lr"] = float(g["base_lr"]) * float(feature_lr_scale)
+            g["base_lr"] = float(g["lr"])
+            continue
 
-    gaussians.optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+        if name == "f_rest":
+            if force_dc_sh:
+                g["lr"] = 0.0
+                g["base_lr"] = 0.0
+            else:
+                g["lr"] = float(g["base_lr"]) * float(feature_lr_scale)
+                g["base_lr"] = float(g["lr"])
+            continue
+
+        # opacity group: optional
+        if name == "opacity":
+            if train_opacity:
+                g["lr"] = float(g["base_lr"]) * float(opacity_lr_scale)
+                g["base_lr"] = float(g["lr"])
+            else:
+                g["lr"] = 0.0
+                g["base_lr"] = 0.0
+            continue
 
     print(
-        f"[STAGE2] Recreated optimizer: "
-        f"lr_dc={lr_dc:g}, "
-        f"{'' if force_dc_sh else f'lr_rest={lr_rest:g}, '} "
-        f"train_opacity={train_opacity}, opacity_lr={float(opt.opacity_lr) * float(opacity_lr_scale):g}, "
-        f"force_dc_sh={force_dc_sh}"
+        f"[STAGE2] Optimizer rebuilt (all groups kept). "
+        f"feature_lr_scale={feature_lr_scale}, train_opacity={train_opacity}, "
+        f"opacity_lr_scale={opacity_lr_scale}, force_dc_sh={force_dc_sh}. "
+        f"Geometry lr set to 0 during warmup (will restore if stage2_densify_after_warmup)."
     )
 
 
-def stage2_apply_warmup_lr(gaussians: GaussianModel, warmup_iters: int, t: int):
+def stage2_apply_warmup_lr(gaussians: GaussianModel, warmup_iters: int, t: int,
+                          warmup_group_names=("f_dc", "f_rest", "opacity")):
     """
-    Linear warmup for stage2 learning rate (per param group).
+    Linear warmup for stage2 learning rate (only for SH/opacity groups).
     IMPORTANT: uses stored 'base_lr' to avoid shrinking LR repeatedly.
     """
     if warmup_iters <= 0:
         return
     w = min(1.0, max(0.0, (t + 1) / float(warmup_iters)))
     for g in gaussians.optimizer.param_groups:
-        base_lr = float(g.get("base_lr", g["lr"]))
+        if g.get("name", "") not in warmup_group_names:
+            continue
+        base_lr = float(g.get("base_lr", g.get("lr", 0.0)))
         g["lr"] = base_lr * w
 
 
@@ -284,6 +313,7 @@ def training(
     stage2_only: bool,
     stage2_train_opacity: bool,
     stage2_opacity_lr_scale: float,
+    stage2_densify_after_warmup: bool,
     save_test_preds: bool,
     test_pred_dirname: str,
     force_dc_sh: bool,
@@ -294,6 +324,13 @@ def training(
       2) --two_stage: stage1 normal training + stage2 finetune (optimizer reset + freeze geometry),
                       BOTH stages still use RGB loss
       3) --stage2_only: start directly in stage2 (use with --start_checkpoint)
+
+    Stage1 GT is forced to 3-ch grayscale (gt_to_gray3).
+    Stage2 uses original RGB GT.
+
+    NEW:
+      --stage2_densify_after_warmup: enable densify/prune ONLY after warmup;
+      and restore geometry lrs/requires_grad so densify works and actually helps.
     """
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -342,6 +379,7 @@ def training(
         stage2_start_iter = None
 
     stage2_initialized = False
+    stage2_geometry_enabled = False  # NEW: geometry lr/grad restored after warmup if densify enabled
     if stage2_only:
         stage2_start_iter = first_iter
 
@@ -355,16 +393,25 @@ def training(
         f"[INFO] mode: "
         f"{'stage2_only' if stage2_only else ('two_stage' if two_stage else 'single_stage')}, "
         f"rgb_finetune_iters={rgb_finetune_iters}, "
-        f"stage2_lr_scale={stage2_feature_lr_scale}, stage2_warmup_iters={stage2_warmup_iters}, "
+        f"stage2_feature_lr_scale={stage2_feature_lr_scale}, stage2_warmup_iters={stage2_warmup_iters}, "
         f"stage2_train_opacity={stage2_train_opacity}, stage2_opacity_lr_scale={stage2_opacity_lr_scale}, "
+        f"stage2_densify_after_warmup={stage2_densify_after_warmup}, "
         f"save_test_preds={save_test_preds}, "
         f"force_dc_sh={force_dc_sh}"
     )
 
     for iteration in range(first_iter, opt.iterations + 1):
-        # Stage selection (only affects optimizer/freeze/densify behavior; loss is always RGB)
+        # Stage selection
         in_stage2 = (stage2_start_iter is not None) and (iteration >= stage2_start_iter)
         cur_stage = "stage2" if in_stage2 else "stage1"
+
+        # Stage2 warmup status
+        if in_stage2 and stage2_start_iter is not None:
+            t2 = iteration - stage2_start_iter  # 0-based
+            stage2_warmup_done = (stage2_warmup_iters <= 0) or (t2 >= stage2_warmup_iters)
+        else:
+            t2 = 0
+            stage2_warmup_done = False
 
         # Stage2 init (once)
         if in_stage2 and (iteration == stage2_start_iter) and (not stage2_initialized):
@@ -376,6 +423,33 @@ def training(
                 force_dc_sh=force_dc_sh,
             )
             stage2_initialized = True
+
+        # If stage2 densify is requested, only enable AFTER warmup.
+        # Also restore geometry lr/grad so densification has "xyz" group and meaningful grads.
+        stage2_densify_ok = (
+            in_stage2 and stage2_initialized and stage2_densify_after_warmup and stage2_warmup_done
+        )
+        if stage2_densify_ok and (not stage2_geometry_enabled):
+            # restore geometry lrs from base_lr
+            for g in gaussians.optimizer.param_groups:
+                if g.get("name", "") in ("xyz", "scaling", "rotation"):
+                    g["lr"] = float(g.get("base_lr", g.get("lr", 0.0)))
+            # enable geometry grads so viewspace_points has grad (densify stats relies on it)
+            gaussians._xyz.requires_grad_(True)
+            gaussians._scaling.requires_grad_(True)
+            gaussians._rotation.requires_grad_(True)
+
+            stage2_geometry_enabled = True
+            print(f"[STAGE2] Warmup done @iter {iteration}. Geometry lr/grad restored; densify/prune enabled.")
+
+        # If stage2 and densify is NOT enabled (or still warming up), keep geometry frozen
+        if in_stage2 and stage2_initialized and (not stage2_geometry_enabled):
+            gaussians._xyz.requires_grad_(False)
+            gaussians._scaling.requires_grad_(False)
+            gaussians._rotation.requires_grad_(False)
+            for g in gaussians.optimizer.param_groups:
+                if g.get("name", "") in ("xyz", "scaling", "rotation"):
+                    g["lr"] = 0.0
 
         # GUI
         if network_gui.conn is None:
@@ -398,12 +472,13 @@ def training(
 
         iter_start.record()
 
-        if not in_stage2:
+        # LR schedule:
+        # - stage1: original behavior
+        # - stage2: only when geometry is enabled (after warmup + flag)
+        if (not in_stage2) or stage2_geometry_enabled:
             gaussians.update_learning_rate(iteration)
 
-        # SH degree schedule:
-        #   - default: original behavior oneup every 1000 iters
-        #   - force_dc_sh: never oneup
+        # SH degree schedule
         if (not force_dc_sh) and (iteration % 1000 == 0):
             gaussians.oneupSHdegree()
 
@@ -431,19 +506,19 @@ def training(
         image_c = torch.clamp(image, 0.0, 1.0)
         gt_c = torch.clamp(gt_image, 0.0, 1.0)
 
+        # Stage1 uses gray3 GT; Stage2 uses RGB GT
         if not in_stage2:
             gt_c = gt_to_gray3(gt_c)
 
-        # RGB loss ALWAYS (both stages)
+        # RGB loss ALWAYS
         loss, Ll1 = compute_rgb_loss(image_c, gt_c, opt)
 
         loss.backward()
         iter_end.record()
 
         with torch.no_grad():
-            # Stage2 warmup
-            if stage2_initialized and in_stage2:
-                t2 = iteration - stage2_start_iter  # 0-based
+            # Stage2 warmup (only affects SH/opacity groups)
+            if stage2_initialized and in_stage2 and (not stage2_warmup_done):
                 stage2_apply_warmup_lr(gaussians, warmup_iters=stage2_warmup_iters, t=t2)
 
             ema_loss_for_log = 0.4 * float(loss.item()) + 0.6 * ema_loss_for_log
@@ -469,8 +544,11 @@ def training(
                 print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
-            # Densification: disable in stage2 (finetune stage)
-            if (not in_stage2) and (iteration < opt.densify_until_iter):
+            # Densification / prune:
+            # - stage1: original constraint (iteration < opt.densify_until_iter)
+            # - stage2: only when stage2_geometry_enabled (warmup done + flag)
+            do_densify = ((not in_stage2) and (iteration < opt.densify_until_iter)) or stage2_geometry_enabled
+            if do_densify:
                 gaussians.max_radii2D[visibility_filter] = torch.max(
                     gaussians.max_radii2D[visibility_filter],
                     radii[visibility_filter]
@@ -525,12 +603,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed,
                 for cam_idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+
                     if not in_stage2:
                         gt_image = gt_to_gray3(gt_image)
-                    
+
                     if gt_image.shape[0] == 1:
                         gt_image = gt_image.repeat(3, 1, 1)
-
 
                     # Save test preds: test_{iter}_{camIdx}.png
                     if save_test_preds and config["name"] == "test":
@@ -584,29 +662,35 @@ if __name__ == "__main__":
     parser.add_argument("--expname", type=str, default="",
                         help="Experiment name prefix for output folder (e.g., stage2_rgb_room1).")
 
-    # Two-stage controls (BOTH stages use RGB loss)
+    # Two-stage controls
     parser.add_argument("--two_stage", action="store_true",
                         help="Stage1 normal training + Stage2 finetune (optimizer reset + freeze geometry). "
-                             "Both stages still use RGB loss.")
+                             "Both stages still use RGB loss (Stage1 GT is gray3, Stage2 GT is RGB).")
     parser.add_argument("--rgb_finetune_iters", type=int, default=1000,
                         help="Number of final iterations to run Stage2 finetune in two-stage mode.")
     parser.add_argument("--stage2_only", action="store_true",
-                        help="Do only Stage2 finetune from the beginning (use with --start_checkpoint). "
-                             "This recreates optimizer and trains SH (and optional opacity) only.")
-    parser.add_argument("--stage2_feature_lr_scale", type=float, default=1,
-                        help="Stage2 feature LR = original feature_lr * this scale (default 0.1).")
+                        help="Do only Stage2 finetune from the beginning (use with --start_checkpoint).")
+
+    # Keep your intent: stage2 SH lr should usually be smaller (default 0.1)
+    parser.add_argument("--stage2_feature_lr_scale", type=float, default=0.1,
+                        help="Stage2 SH feature lr scale (multiply original). Default 0.1.")
     parser.add_argument("--stage2_warmup_iters", type=int, default=100,
-                        help="Warmup iterations for stage2 LR (0 disables).")
+                        help="Warmup iterations for stage2 SH lr (0 disables).")
+
+    # NEW: enable densify/prune after warmup in stage2
+    parser.add_argument("--stage2_densify_after_warmup", action="store_true",
+                        help="If set, enable densify+prune in stage2 ONLY after warmup; "
+                             "also restores geometry lr/grad so densification won't crash and can help.")
 
     # Stage2 train opacity
     parser.add_argument("--stage2_train_opacity", action="store_true",
-                        help="In stage2, also train opacity (sometimes helps prevent finetune from flying).")
+                        help="In stage2, also train opacity.")
     parser.add_argument("--stage2_opacity_lr_scale", type=float, default=0.2,
-                        help="Stage2 opacity LR = original opacity_lr * this scale (default 0.2).")
+                        help="Stage2 opacity lr scale (multiply original). Default 0.2.")
 
-    # NEW: force DC SH
+    # Force DC SH
     parser.add_argument("--force_DC_SH", action="store_true",
-                        help="Force using DC-only SH (never increase SH degree; stage2 trains only f_dc).")
+                        help="Force using DC-only SH (never increase SH degree; f_rest lr=0 in stage2).")
 
     # Save test preds
     parser.add_argument("--save_test_preds", action="store_true",
@@ -630,7 +714,10 @@ if __name__ == "__main__":
     resolve_model_path(args)
 
     args.save_iterations.append(args.iterations)
-    test_iterations = [x for x in range(0, args.iterations + 1, 2000)] + [x for x in range(args.iterations - args.rgb_finetune_iters, args.iterations + 1, 100) ]
+    test_iterations = (
+        [x for x in range(0, args.iterations + 1, 2000)]
+        + [x for x in range(max(0, args.iterations - args.rgb_finetune_iters), args.iterations + 1, 100)]
+    )
 
     print("Optimizing " + str(args.model_path))
     safe_state(args.quiet)
@@ -658,6 +745,7 @@ if __name__ == "__main__":
         args.stage2_only,
         args.stage2_train_opacity,
         args.stage2_opacity_lr_scale,
+        args.stage2_densify_after_warmup,
         save_test_preds=args.save_test_preds,
         test_pred_dirname=args.test_pred_dirname,
         force_dc_sh=args.force_DC_SH,

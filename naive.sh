@@ -18,29 +18,32 @@ do
 #   --expname "rgb_baseline_${dir}" | tee -a log/${dir}_rgb_DC_baseline.log
 
 python train.py -s ./data/$dir/ --eval \
-  --expname "_stage2_DC_rgb_500${dir}" \
+  --expname "_stage2_DC_rgb_500_PRUNE_DENSIFY${dir}" \
   --save_test_preds \
   --force_DC_SH \
   --stage2_train_opacity \
+  --stage2_densify_after_warmup \
   --stage2_feature_lr_scale 10 \
   --two_stage --rgb_finetune_iters 500 \
   --stage2_feature_lr_scale 10 --stage2_warmup_iters 200 | tee -a log/${dir}_stage2_DC_rgb_500.log
 
 
 python train.py -s ./data/$dir/ --eval \
-  --expname "_stage2_DC_rgb_200${dir}" \
+  --expname "_stage2_DC_rgb_200_PRUNE_DENSIFY${dir}" \
   --save_test_preds \
   --force_DC_SH \
   --stage2_train_opacity \
+  --stage2_densify_after_warmup \
   --stage2_feature_lr_scale 10 \
   --two_stage --rgb_finetune_iters 200 \
   --stage2_feature_lr_scale 10 --stage2_warmup_iters 100 | tee -a log/${dir}_stage2_DC_rgb_200.log
 
 python train.py -s ./data/$dir/ --eval \
-  --expname "_stage2_DC_rgb_1000${dir}" \
+  --expname "_stage2_DC_rgb_1000_PRUNE_DENSIFY${dir}" \
   --save_test_preds \
   --force_DC_SH \
   --stage2_train_opacity \
+  --stage2_densify_after_warmup \
   --stage2_feature_lr_scale 10 \
   --two_stage --rgb_finetune_iters 1000 \
   --stage2_feature_lr_scale 10 --stage2_warmup_iters 500 | tee -a log/${dir}_stage2_DC_rgb_1000.log
