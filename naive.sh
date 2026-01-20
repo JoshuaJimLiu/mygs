@@ -15,12 +15,20 @@ do
 python train.py \
   -s ./data/$dir/ --eval \
   --expname "gray2rgb_SH_op_${dir}" \
-  --two_stage --rgb_finetune_iters 500 \
-  --stage2_feature_lr_scale 1 \
+  --two_stage --rgb_finetune_iters 100 \
+  --stage2_feature_lr_scale 0.1 \
   --stage2_train_opacity --stage2_opacity_lr_scale 10 \
-  --stage2_project_gray \
-  --stage2_warmup_iters 200 \
-  | tee -a log/${dir}_gray2rgb_stage2_sh_op.log
+  --stage2_warmup_iters 50 \
+  | tee -a log/${dir}_gray2rgb_stage2_DC_100_op.log
+
+python train.py \
+  -s ./data/$dir/ --eval \
+  --expname "gray2rgb_SH_op_${dir}" \
+  --two_stage --rgb_finetune_iters 50 \
+  --stage2_feature_lr_scale 0.1 \
+  --stage2_train_opacity --stage2_opacity_lr_scale 10 \
+  --stage2_warmup_iters 30 \
+  | tee -a log/${dir}_gray2rgb_stage2_DC_30_op.log
 
 done
 

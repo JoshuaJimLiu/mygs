@@ -371,7 +371,7 @@ def training(
         gaussians.update_learning_rate(iteration)
 
         # SH degree schedule
-        if iteration % 1000 == 0:
+        if iteration % 1000 == 0 and 0: # use DC
             gaussians.oneupSHdegree()
 
         # Pick a random camera
@@ -399,7 +399,7 @@ def training(
         gt_c = torch.clamp(gt_image, 0.0, 1.0)
 
         # Loss
-        if cur_stage == "rgb":
+        if cur_stage == "rgb" or 1:
             loss, Ll1 = compute_rgb_loss(image_c, gt_c, opt)
 
             if (stage2_start_iter is not None) and (iteration == stage2_start_iter):
