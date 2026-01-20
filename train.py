@@ -1,4 +1,3 @@
-# train.py
 #
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
@@ -34,18 +33,38 @@ except ImportError:
 
 
 # ==============================================================================
-# Color helpers
+# Misc helpers
 # ==============================================================================
-def rgb_to_luma(rgb_chw: torch.Tensor) -> torch.Tensor:
+def gt_to_gray3(x: torch.Tensor, *, weights=(0.299, 0.587, 0.114)) -> torch.Tensor:
     """
-    rgb_chw: (3,H,W) in [0,1]
-    return:  (1,H,W) luma (PIL-like weights)
+    Convert GT image to 3-channel grayscale (gray repeated in RGB).
+    Supports:
+      - CHW: (C,H,W) where C=1 or 3
+      - NCHW: (N,C,H,W) where C=1 or 3
+    Input expected in [0,1] (but we don't enforce it).
+    Output dtype/device matches input.
     """
-    r = rgb_chw[0:1]
-    g = rgb_chw[1:2]
-    b = rgb_chw[2:3]
-    return 0.299 * r + 0.587 * g + 0.114 * b
+    if x.dim() == 3:
+        c, h, w = x.shape
+        if c == 1:
+            return x.repeat(3, 1, 1)
+        if c != 3:
+            raise ValueError(f"Expected C=1 or 3 for CHW, got {x.shape}")
+        r, g, b = x[0:1], x[1:2], x[2:3]
+        y = weights[0] * r + weights[1] * g + weights[2] * b  # (1,H,W)
+        return y.repeat(3, 1, 1)
 
+    if x.dim() == 4:
+        n, c, h, w = x.shape
+        if c == 1:
+            return x.repeat(1, 3, 1, 1)
+        if c != 3:
+            raise ValueError(f"Expected C=1 or 3 for NCHW, got {x.shape}")
+        r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+        y = weights[0] * r + weights[1] * g + weights[2] * b  # (N,1,H,W)
+        return y.repeat(1, 3, 1, 1)
+
+    raise ValueError(f"Expected CHW or NCHW tensor, got dim={x.dim()}, shape={tuple(x.shape)}")
 
 def _sanitize_expname(name: str) -> str:
     """
@@ -146,6 +165,8 @@ def prepare_output_and_logger(dataset):
         f.write(str(Namespace(**vars(dataset))))
 
     tb_writer = None
+
+
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(dataset.model_path)
     else:
@@ -154,40 +175,21 @@ def prepare_output_and_logger(dataset):
 
 
 # ==============================================================================
-# Stage-2 stabilization helpers
+# Stage-2 (finetune) optimizer
 # ==============================================================================
-@torch.no_grad()
-def project_sh_to_gray(gaussians: GaussianModel):
-    """
-    Make SH colors grayscale (R=G=B) by averaging RGB channels per coeff.
-    Helps reduce chroma shock when switching to RGB loss.
-    """
-    if hasattr(gaussians, "_features_dc") and gaussians._features_dc.numel() > 0:
-        dc = gaussians._features_dc.data
-        m = dc.mean(dim=-1, keepdim=True)
-        dc.copy_(m.expand_as(dc))
-
-    if hasattr(gaussians, "_features_rest") and gaussians._features_rest.numel() > 0:
-        rst = gaussians._features_rest.data
-        m = rst.mean(dim=-1, keepdim=True)
-        rst.copy_(m.expand_as(rst))
-
-
 def setup_stage2_optimizer(
     gaussians: GaussianModel,
     opt,
     feature_lr_scale: float = 0.1,
-    do_project_gray: bool = True,
     train_opacity: bool = False,
     opacity_lr_scale: float = 0.1,
+    force_dc_sh: bool = False,
 ):
     """
     Stage-2: freeze geometry (xyz/scale/rot), train SH (and optionally opacity).
     Recreate optimizer from scratch (clears Adam moments).
+    NOTE: loss is still RGB loss (no gray/luma conversion here).
     """
-    if do_project_gray:
-        project_sh_to_gray(gaussians)
-
     # Freeze geometry
     gaussians._xyz.requires_grad_(False)
     gaussians._scaling.requires_grad_(False)
@@ -196,17 +198,22 @@ def setup_stage2_optimizer(
     # Opacity: optional
     gaussians._opacity.requires_grad_(bool(train_opacity))
 
-    # Train SH parameters
+    # Train SH parameters (but if force_dc_sh: only train DC, freeze rest)
     gaussians._features_dc.requires_grad_(True)
-    gaussians._features_rest.requires_grad_(True)
+    if hasattr(gaussians, "_features_rest") and gaussians._features_rest is not None:
+        gaussians._features_rest.requires_grad_(not force_dc_sh)
 
     lr_dc = float(opt.feature_lr) * float(feature_lr_scale)
     lr_rest = float(opt.feature_lr / 20.0) * float(feature_lr_scale)
 
     param_groups = [
         {"params": [gaussians._features_dc], "lr": lr_dc, "base_lr": lr_dc, "name": "f_dc"},
-        {"params": [gaussians._features_rest], "lr": lr_rest, "base_lr": lr_rest, "name": "f_rest"},
     ]
+
+    if (not force_dc_sh) and hasattr(gaussians, "_features_rest") and gaussians._features_rest is not None:
+        param_groups.append(
+            {"params": [gaussians._features_rest], "lr": lr_rest, "base_lr": lr_rest, "name": "f_rest"}
+        )
 
     if train_opacity:
         lr_op = float(opt.opacity_lr) * float(opacity_lr_scale)
@@ -216,16 +223,17 @@ def setup_stage2_optimizer(
 
     print(
         f"[STAGE2] Recreated optimizer: "
-        f"lr_dc={lr_dc:g}, lr_rest={lr_rest:g}, "
+        f"lr_dc={lr_dc:g}, "
+        f"{'' if force_dc_sh else f'lr_rest={lr_rest:g}, '} "
         f"train_opacity={train_opacity}, opacity_lr={float(opt.opacity_lr) * float(opacity_lr_scale):g}, "
-        f"project_gray={do_project_gray}"
+        f"force_dc_sh={force_dc_sh}"
     )
 
 
 def stage2_apply_warmup_lr(gaussians: GaussianModel, warmup_iters: int, t: int):
     """
     Linear warmup for stage2 learning rate (per param group).
-    IMPORTANT: uses stored 'base_lr' to avoid the common bug of shrinking LR repeatedly.
+    IMPORTANT: uses stored 'base_lr' to avoid shrinking LR repeatedly.
     """
     if warmup_iters <= 0:
         return
@@ -236,25 +244,30 @@ def stage2_apply_warmup_lr(gaussians: GaussianModel, warmup_iters: int, t: int):
 
 
 # ==============================================================================
-# Losses
+# Losses (RGB only)
 # ==============================================================================
 def compute_rgb_loss(image_c, gt_c, opt):
     Ll1 = l1_loss(image_c, gt_c)
     return (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image_c, gt_c)), Ll1
 
 
-def compute_gray_loss_equiv(image_c, gt_c, opt):
+# ==============================================================================
+# Image saving helper (test preds)
+# ==============================================================================
+def _save_chw_png(path: str, chw: torch.Tensor):
     """
-    Gray loss (luma) computed from RGB images.
-    Returns total_loss, Ll1(gray)
+    Save CHW float tensor in [0,1] as PNG. Supports C=1/3.
     """
-    pred_y = rgb_to_luma(image_c)  # (1,H,W)
-    gt_y = rgb_to_luma(gt_c)       # (1,H,W)
-    pred_y3 = pred_y.repeat(3, 1, 1)
-    gt_y3 = gt_y.repeat(3, 1, 1)
-    Ll1 = l1_loss(pred_y3, gt_y3)
-    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(pred_y3, gt_y3))
-    return loss, Ll1
+    from PIL import Image
+
+    x = chw.detach()
+    if x.dim() != 3:
+        raise ValueError(f"Expected CHW tensor, got shape {tuple(x.shape)}")
+    if x.shape[0] == 1:
+        x = x.repeat(3, 1, 1)
+    x = x.clamp(0.0, 1.0)
+    arr = (x * 255.0).byte().permute(1, 2, 0).cpu().numpy()  # HWC uint8
+    Image.fromarray(arr).save(path)
 
 
 # ==============================================================================
@@ -264,20 +277,22 @@ def training(
     dataset, opt, pipe,
     testing_iterations, saving_iterations, checkpoint_iterations,
     checkpoint, debug_from,
-    color_loss: str,
     two_stage: bool,
     rgb_finetune_iters: int,
     stage2_feature_lr_scale: float,
     stage2_warmup_iters: int,
-    stage2_project_gray: bool,
     stage2_only: bool,
     stage2_train_opacity: bool,
     stage2_opacity_lr_scale: float,
+    save_test_preds: bool,
+    test_pred_dirname: str,
+    force_dc_sh: bool,
 ):
     """
     Modes:
-      1) single-stage: --color_loss {rgb,gray}
-      2) --two_stage: gray-loss first, then RGB-loss for last --rgb_finetune_iters
+      1) single-stage (default): RGB loss for all iters
+      2) --two_stage: stage1 normal training + stage2 finetune (optimizer reset + freeze geometry),
+                      BOTH stages still use RGB loss
       3) --stage2_only: start directly in stage2 (use with --start_checkpoint)
     """
     first_iter = 0
@@ -291,6 +306,16 @@ def training(
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
         print(f"[INFO] Restored checkpoint: {checkpoint}, first_iter={first_iter}")
+
+    # Force DC SH: never increase SH degree; keep active_sh_degree at 0 if exists
+    if force_dc_sh:
+        if hasattr(gaussians, "active_sh_degree"):
+            try:
+                gaussians.active_sh_degree = 0
+            except Exception:
+                pass
+        if hasattr(gaussians, "_features_rest") and gaussians._features_rest is not None:
+            gaussians._features_rest.requires_grad_(False)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -308,7 +333,7 @@ def training(
     rgb_finetune_iters = max(0, int(rgb_finetune_iters))
     if two_stage:
         if rgb_finetune_iters <= 0 or rgb_finetune_iters >= opt.iterations:
-            print("[WARN] two_stage enabled but rgb_finetune_iters invalid; falling back to single-stage rgb.")
+            print("[WARN] two_stage enabled but rgb_finetune_iters invalid; falling back to single-stage.")
             two_stage = False
             stage2_start_iter = None
         else:
@@ -320,29 +345,35 @@ def training(
     if stage2_only:
         stage2_start_iter = first_iter
 
+    # where to save test preds
+    test_pred_dir = os.path.join(scene.model_path, test_pred_dirname)
+    if save_test_preds:
+        os.makedirs(test_pred_dir, exist_ok=True)
+        print(f"[INFO] Will save test preds to: {test_pred_dir}")
+
     print(
         f"[INFO] mode: "
         f"{'stage2_only' if stage2_only else ('two_stage' if two_stage else 'single_stage')}, "
-        f"color_loss(single)={color_loss}, rgb_finetune_iters={rgb_finetune_iters}, "
+        f"rgb_finetune_iters={rgb_finetune_iters}, "
         f"stage2_lr_scale={stage2_feature_lr_scale}, stage2_warmup_iters={stage2_warmup_iters}, "
-        f"stage2_project_gray={stage2_project_gray}, "
-        f"stage2_train_opacity={stage2_train_opacity}, stage2_opacity_lr_scale={stage2_opacity_lr_scale}"
+        f"stage2_train_opacity={stage2_train_opacity}, stage2_opacity_lr_scale={stage2_opacity_lr_scale}, "
+        f"save_test_preds={save_test_preds}, "
+        f"force_dc_sh={force_dc_sh}"
     )
+
     for iteration in range(first_iter, opt.iterations + 1):
-        # Stage selection
-        if stage2_start_iter is not None and iteration >= stage2_start_iter:
-            cur_stage = "rgb"
-        else:
-            cur_stage = "gray" if two_stage else color_loss
+        # Stage selection (only affects optimizer/freeze/densify behavior; loss is always RGB)
+        in_stage2 = (stage2_start_iter is not None) and (iteration >= stage2_start_iter)
+        cur_stage = "stage2" if in_stage2 else "stage1"
 
         # Stage2 init (once)
-        if (stage2_start_iter is not None) and (iteration == stage2_start_iter) and (not stage2_initialized):
+        if in_stage2 and (iteration == stage2_start_iter) and (not stage2_initialized):
             setup_stage2_optimizer(
                 gaussians, opt,
                 feature_lr_scale=stage2_feature_lr_scale,
-                do_project_gray=stage2_project_gray,
                 train_opacity=stage2_train_opacity,
                 opacity_lr_scale=stage2_opacity_lr_scale,
+                force_dc_sh=force_dc_sh,
             )
             stage2_initialized = True
 
@@ -367,11 +398,13 @@ def training(
 
         iter_start.record()
 
-        # LR schedule for xyz group (only meaningful when xyz is in optimizer)
-        gaussians.update_learning_rate(iteration)
+        if not in_stage2:
+            gaussians.update_learning_rate(iteration)
 
-        # SH degree schedule
-        if iteration % 1000 == 0 and 0: # use DC
+        # SH degree schedule:
+        #   - default: original behavior oneup every 1000 iters
+        #   - force_dc_sh: never oneup
+        if (not force_dc_sh) and (iteration % 1000 == 0):
             gaussians.oneupSHdegree()
 
         # Pick a random camera
@@ -398,31 +431,18 @@ def training(
         image_c = torch.clamp(image, 0.0, 1.0)
         gt_c = torch.clamp(gt_image, 0.0, 1.0)
 
-        # Loss
-        if cur_stage == "rgb" or 1:
-            loss, Ll1 = compute_rgb_loss(image_c, gt_c, opt)
+        if not in_stage2:
+            gt_c = gt_to_gray3(gt_c)
 
-            if (stage2_start_iter is not None) and (iteration == stage2_start_iter):
-                gray_loss_equiv, gray_l1 = compute_gray_loss_equiv(image_c, gt_c, opt)
-                print(
-                    f"[STAGE2-DEBUG @iter {iteration}] "
-                    f"gray_equiv_loss={float(gray_loss_equiv):.6f} (L1y={float(gray_l1):.6f}), "
-                    f"rgb_loss={float(loss):.6f} (L1rgb={float(Ll1):.6f}), "
-                    f"pred[min,max]=({float(image_c.min()):.4f},{float(image_c.max()):.4f}), "
-                    f"gt[min,max]=({float(gt_c.min()):.4f},{float(gt_c.max()):.4f})"
-                )
-        elif cur_stage == "gray":
-            loss, Ll1 = compute_gray_loss_equiv(image_c, gt_c, opt)
-        else:
-            raise ValueError(f"Unknown stage/loss mode: {cur_stage}")
+        # RGB loss ALWAYS (both stages)
+        loss, Ll1 = compute_rgb_loss(image_c, gt_c, opt)
 
         loss.backward()
         iter_end.record()
 
         with torch.no_grad():
             # Stage2 warmup
-            in_stage2 = stage2_initialized and (stage2_start_iter is not None) and (iteration >= stage2_start_iter)
-            if in_stage2:
+            if stage2_initialized and in_stage2:
                 t2 = iteration - stage2_start_iter  # 0-based
                 stage2_apply_warmup_lr(gaussians, warmup_iters=stage2_warmup_iters, t=t2)
 
@@ -439,14 +459,17 @@ def training(
                 testing_iterations,
                 scene, render,
                 (pipe, background),
-                psnr_test_records
+                psnr_test_records,
+                save_test_preds=save_test_preds,
+                test_pred_dir=test_pred_dir,
+                in_stage2=in_stage2
             )
 
             if iteration in saving_iterations:
                 print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
-            # Densification: disable in stage2 (features/opacity-only finetune)
+            # Densification: disable in stage2 (finetune stage)
             if (not in_stage2) and (iteration < opt.densify_until_iter):
                 gaussians.max_radii2D[visibility_filter] = torch.max(
                     gaussians.max_radii2D[visibility_filter],
@@ -477,7 +500,11 @@ def training(
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed,
                     testing_iterations, scene: Scene, renderFunc, renderArgs,
-                    psnr_test_records):
+                    psnr_test_records,
+                    save_test_preds: bool,
+                    test_pred_dir: str,
+                    in_stage2: bool = False
+                    ):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', float(Ll1.item()), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', float(loss.item()), iteration)
@@ -494,13 +521,27 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed,
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test_val = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
+
+                for cam_idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    if not in_stage2:
+                        gt_image = gt_to_gray3(gt_image)
+                    
                     if gt_image.shape[0] == 1:
                         gt_image = gt_image.repeat(3, 1, 1)
 
-                    if tb_writer and (idx < 5):
+
+                    # Save test preds: test_{iter}_{camIdx}.png
+                    if save_test_preds and config["name"] == "test":
+                        try:
+                            out_name = f"test_{int(iteration)}_{int(cam_idx)}.png"
+                            out_path = os.path.join(test_pred_dir, out_name)
+                            _save_chw_png(out_path, image)
+                        except Exception as e:
+                            print(f"[WARN] Failed to save test pred (iter={iteration}, cam={cam_idx}): {e}")
+
+                    if tb_writer and (cam_idx < 5):
                         tb_writer.add_images(
                             config['name'] + "_view_{}/render".format(viewpoint.image_name),
                             image[None],
@@ -541,32 +582,37 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
 
     parser.add_argument("--expname", type=str, default="",
-                        help="Experiment name prefix for output folder (e.g., grayAsRGB_SH_room1).")
+                        help="Experiment name prefix for output folder (e.g., stage2_rgb_room1).")
 
-    # Two-stage controls
+    # Two-stage controls (BOTH stages use RGB loss)
     parser.add_argument("--two_stage", action="store_true",
-                        help="Run gray-loss first, then RGB-loss for the last --rgb_finetune_iters.")
+                        help="Stage1 normal training + Stage2 finetune (optimizer reset + freeze geometry). "
+                             "Both stages still use RGB loss.")
     parser.add_argument("--rgb_finetune_iters", type=int, default=1000,
-                        help="Number of final iterations to finetune with RGB loss in two-stage mode.")
+                        help="Number of final iterations to run Stage2 finetune in two-stage mode.")
     parser.add_argument("--stage2_only", action="store_true",
-                        help="Do only 'RGB finetune' mode from the beginning (use with --start_checkpoint). "
+                        help="Do only Stage2 finetune from the beginning (use with --start_checkpoint). "
                              "This recreates optimizer and trains SH (and optional opacity) only.")
-    parser.add_argument("--stage2_feature_lr_scale", type=float, default=0.1,
+    parser.add_argument("--stage2_feature_lr_scale", type=float, default=1,
                         help="Stage2 feature LR = original feature_lr * this scale (default 0.1).")
     parser.add_argument("--stage2_warmup_iters", type=int, default=100,
                         help="Warmup iterations for stage2 LR (0 disables).")
-    parser.add_argument("--stage2_project_gray", action="store_true",
-                        help="Before stage2, project SH colors to grayscale (R=G=B) to reduce loss spike.")
 
-    # NEW: stage2 train opacity
+    # Stage2 train opacity
     parser.add_argument("--stage2_train_opacity", action="store_true",
-                        help="In stage2, also train opacity (often helps prevent RGB finetune from flying).")
+                        help="In stage2, also train opacity (sometimes helps prevent finetune from flying).")
     parser.add_argument("--stage2_opacity_lr_scale", type=float, default=0.2,
                         help="Stage2 opacity LR = original opacity_lr * this scale (default 0.2).")
 
-    # Single-stage fallback
-    parser.add_argument("--color_loss", type=str, choices=["rgb", "gray"], default="rgb",
-                        help="Single-stage training loss: RGB or gray(luma). Ignored in --two_stage/--stage2_only.")
+    # NEW: force DC SH
+    parser.add_argument("--force_DC_SH", action="store_true",
+                        help="Force using DC-only SH (never increase SH degree; stage2 trains only f_dc).")
+
+    # Save test preds
+    parser.add_argument("--save_test_preds", action="store_true",
+                        help="If set, save test predictions at each test iteration as test_{iter}_{camIdx}.png")
+    parser.add_argument("--test_pred_dirname", type=str, default="test_preds",
+                        help="Subfolder name under output folder for saved test predictions.")
 
     # Other original args
     parser.add_argument('--ip', type=str, default="127.0.0.1")
@@ -584,7 +630,7 @@ if __name__ == "__main__":
     resolve_model_path(args)
 
     args.save_iterations.append(args.iterations)
-    test_iterations = [x for x in range(0, args.iterations + 1, 500)]
+    test_iterations = [x for x in range(0, args.iterations + 1, 2000)] + [x for x in range(args.iterations - args.rgb_finetune_iters, args.iterations + 1, 100) ]
 
     print("Optimizing " + str(args.model_path))
     safe_state(args.quiet)
@@ -605,15 +651,16 @@ if __name__ == "__main__":
         args.checkpoint_iterations,
         args.start_checkpoint,
         args.debug_from,
-        args.color_loss,
         args.two_stage,
         args.rgb_finetune_iters,
         args.stage2_feature_lr_scale,
         args.stage2_warmup_iters,
-        args.stage2_project_gray,
         args.stage2_only,
         args.stage2_train_opacity,
         args.stage2_opacity_lr_scale,
+        save_test_preds=args.save_test_preds,
+        test_pred_dirname=args.test_pred_dirname,
+        force_dc_sh=args.force_DC_SH,
     )
 
     print("\nTraining complete.")
