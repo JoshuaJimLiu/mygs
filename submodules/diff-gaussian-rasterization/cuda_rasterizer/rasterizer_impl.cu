@@ -152,16 +152,16 @@ void CudaRasterizer::Rasterizer::markVisible(
 		present);
 }
 
-CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
+CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P, int channels)
 {
 	GeometryState geom;
 	obtain(chunk, geom.depths, P, 128);
-	obtain(chunk, geom.clamped, P * 3, 128);
+	obtain(chunk, geom.clamped, P * channels, 128);     // <- P*channels
 	obtain(chunk, geom.internal_radii, P, 128);
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
-	obtain(chunk, geom.rgb, P * 3, 128);
+	obtain(chunk, geom.features, P * channels, 128);    // <- P*channels
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
@@ -200,6 +200,7 @@ int CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
 	const int P, int D, int M,
+	int channels,                   // <- NEW
 	const float* background,
 	const int width, int height,
 	const float* means3D,
@@ -222,10 +223,12 @@ int CudaRasterizer::Rasterizer::forward(
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	size_t chunk_size = required<GeometryState>(P);
-	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+	if (!(channels == 1 || channels == 3))
+		throw std::runtime_error("channels must be 1 or 3");
 
+	size_t chunk_size = requiredGeometry(P, channels);
+	char* chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P, channels);
 	if (radii == nullptr)
 	{
 		radii = geomState.internal_radii;
@@ -239,14 +242,10 @@ int CudaRasterizer::Rasterizer::forward(
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
 
-	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
-	{
-		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
-	}
-
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
+		channels,                    // <- NEW
 		means3D,
 		(glm::vec3*)scales,
 		scale_modifier,
@@ -265,7 +264,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		geomState.depths,
 		geomState.cov3D,
-		geomState.rgb,
+		geomState.features, // RGB or grayscale features
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
@@ -318,12 +317,13 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(, debug)
 
 	// Let each tile blend its range of Gaussians independently in parallel
-	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	const float* feature_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.features;
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
+		channels,                    // <- NEW
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
@@ -339,6 +339,7 @@ int CudaRasterizer::Rasterizer::forward(
 // to forward render pass
 void CudaRasterizer::Rasterizer::backward(
 	const int P, int D, int M, int R,
+	int channels,                   // <- NEW
 	const float* background,
 	const int width, int height,
 	const float* means3D,
@@ -368,7 +369,10 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_drot,
 	bool debug)
 {
-	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
+    if (!(channels == 1 || channels == 3))
+        throw std::runtime_error("channels must be 1 or 3");
+
+    GeometryState geomState = GeometryState::fromChunk(geom_buffer, P, channels);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
 
@@ -386,13 +390,14 @@ void CudaRasterizer::Rasterizer::backward(
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
-	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
+    const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.features;
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
+		channels,                    // <- NEW
 		background,
 		geomState.means2D,
 		geomState.conic_opacity,
@@ -410,6 +415,7 @@ void CudaRasterizer::Rasterizer::backward(
 	// use the one we computed ourselves.
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
 	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
+		channels,                    // <- NEW
 		(float3*)means3D,
 		radii,
 		shs,

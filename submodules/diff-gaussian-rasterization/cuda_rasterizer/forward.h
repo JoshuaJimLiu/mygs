@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -20,8 +20,25 @@
 
 namespace FORWARD
 {
+	// NOTE about layouts:
+	// - channels == 3:
+	//     shs:            float* storing P * M * 3 floats (treated as glm::vec3[M] per point)
+	//     colors_precomp: float* storing P * 3
+	//     colors:         float* storing P * 3
+	//     bg_color:       float* length 3
+	//     clamped:        bool*  length P * 3 (per-channel clamp flags)
+	//
+	// - channels == 1:
+	//     shs:            float* storing P * M (scalar SH per point)
+	//     colors_precomp: float* storing P
+	//     colors:         float* storing P
+	//     bg_color:       float* length 1
+	//     clamped:        bool*  length P (scalar clamp flag)
+
 	// Perform initial steps for each Gaussian prior to rasterization.
-	void preprocess(int P, int D, int M,
+	void preprocess(
+		int P, int D, int M,
+		int channels,
 		const float* orig_points,
 		const glm::vec3* scales,
 		const float scale_modifier,
@@ -53,6 +70,7 @@ namespace FORWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		int channels,
 		const float2* points_xy_image,
 		const float* features,
 		const float4* conic_opacity,

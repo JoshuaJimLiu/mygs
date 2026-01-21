@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -20,11 +20,16 @@
 
 namespace BACKWARD
 {
+	// Layout notes match forward.h:
+	// channels==3: clamped is P*3; dL_dcolor is P*3; dL_dsh is P*M*3 (glm::vec3 per coeff)
+	// channels==1: clamped is P;   dL_dcolor is P;   dL_dsh is P*M
+
 	void render(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		int channels,
 		const float* bg_color,
 		const float2* means2D,
 		const float4* conic_opacity,
@@ -39,6 +44,7 @@ namespace BACKWARD
 
 	void preprocess(
 		int P, int D, int M,
+		int channels,
 		const float3* means,
 		const int* radii,
 		const float* shs,

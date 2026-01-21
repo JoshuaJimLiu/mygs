@@ -31,16 +31,16 @@ namespace CudaRasterizer
 		size_t scan_size;
 		float* depths;
 		char* scanning_space;
-		bool* clamped;
+		bool* clamped;          // size = P * channels
 		int* internal_radii;
 		float2* means2D;
 		float* cov3D;
 		float4* conic_opacity;
-		float* rgb;
+		float* features;        // 原 rgb -> 改名 features，size = P * channels
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
 
-		static GeometryState fromChunk(char*& chunk, size_t P);
+		static GeometryState fromChunk(char*& chunk, size_t P, int channels);
 	};
 
 	struct ImageState
@@ -71,4 +71,11 @@ namespace CudaRasterizer
 		T::fromChunk(size, P);
 		return ((size_t)size) + 128;
 	}
+	static size_t requiredGeometry(size_t P, int channels)
+	{
+		char* size = nullptr;
+		GeometryState::fromChunk(size, P, channels);
+		return ((size_t)size) + 128;
+	}
+
 };
