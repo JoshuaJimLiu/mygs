@@ -140,8 +140,8 @@ RasterizeGaussiansCUDA(
 			}
 			M = (int)sh.size(1);
 		} else { // channels == 1
-			if (sh.ndimension() != 2 || sh.size(0) != P) {
-				AT_ERROR("For channels=1, sh must have shape (P, M). Got sizes=", sh.sizes());
+			if (sh.ndimension() != 3 || sh.size(0) != P || sh.size(2) != 1) {
+				AT_ERROR("For channels=1, sh must have shape (P, M, 1). Got sizes=", sh.sizes());
 			}
 			M = (int)sh.size(1);
 		}
@@ -278,8 +278,8 @@ RasterizeGaussiansBackwardCUDA(
 			}
 			M = (int)sh.size(1);
 		} else {
-			if (sh.ndimension() != 2 || sh.size(0) != P) {
-				AT_ERROR("For channels=1, sh must have shape (P, M). Got sizes=", sh.sizes());
+			if (sh.ndimension() != 3 || sh.size(0) != P || sh.size(2) != 1) {
+				AT_ERROR("For channels=1, sh must have shape (P, M, 1). Got sizes=", sh.sizes());
 			}
 			M = (int)sh.size(1);
 		}
@@ -301,7 +301,7 @@ RasterizeGaussiansBackwardCUDA(
 	torch::Tensor dL_dsh;
 	if (has_sh) {
 		if (channels == 3) dL_dsh = torch::zeros({P, M, 3}, means3D.options());
-		else              dL_dsh = torch::zeros({P, M}, means3D.options());
+		else              dL_dsh = torch::zeros({P, M, 1}, means3D.options());
 	} else {
 		// keep an empty tensor for API compatibility
 		dL_dsh = torch::empty({0}, means3D.options());

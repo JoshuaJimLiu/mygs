@@ -18,8 +18,11 @@ do
 #   --expname "rgb_baseline_${dir}" | tee -a log/${dir}_rgb_DC_baseline.log
 
 python train.py -s ./data/$dir/ --eval \
+  --expname "ONESTAGE_BASELINE${dir}" \
+  --force_DC_SH 
+
+python train.py -s ./data/$dir/ --eval \
   --expname "_stage2_DC_rgb_500_PRUNE_DENSIFY${dir}" \
-  --save_test_preds \
   --force_DC_SH \
   --stage2_train_opacity \
   --stage2_densify_after_warmup \

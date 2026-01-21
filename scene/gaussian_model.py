@@ -462,3 +462,24 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+    def convert_SHs_to_Gray(self):
+        # only use one-channel sh 
+        # discard other channels
+        print(f'[INFO] Converting SHs to one-channel grayscale SHs for two-stage training.')
+        self._features_dc = nn.Parameter(self._features_dc[:, :, :1].contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(self._features_rest[:, :, :1].contiguous().requires_grad_(True))
+        print(f'[INFO] New SH feature dimensions: DC {self._features_dc.shape}, Rest {self._features_rest.shape}')
+        
+    def convert_SHs_to_RGB(self):
+        # convert one-channel sh to RGB sh
+        # by replicating the single channel three times
+        print(f'[INFO] Converting one-channel grayscale SHs to full RGB SHs for stage 2 training.')
+        f_dc_gray = self._features_dc[:, :, :1].contiguous()
+        f_rest_gray = self._features_rest[:, :, :1].contiguous()
+
+        f_dc_rgb = f_dc_gray.repeat(1, 1, 3).contiguous()
+        f_rest_rgb = f_rest_gray.repeat(1, 1, 3).contiguous()
+
+        self._features_dc = nn.Parameter(f_dc_rgb.requires_grad_(True))
+        self._features_rest = nn.Parameter(f_rest_rgb.requires_grad_(True))
+        print(f'[INFO] New SH feature dimensions: DC {self._features_dc.shape}, Rest {self._features_rest.shape}')

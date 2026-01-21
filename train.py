@@ -36,6 +36,9 @@ except ImportError:
 # Misc helpers
 # ==============================================================================
 def gt_to_gray3(x: torch.Tensor, *, weights=(0.299, 0.587, 0.114)) -> torch.Tensor:
+    out = gt_to_gray1(x, weights=weights)
+    return out.repeat(3, 1, 1)
+def gt_to_gray1(x: torch.Tensor, *, weights=(0.299, 0.587, 0.114)) -> torch.Tensor:
     """
     Convert GT image to 3-channel grayscale (gray repeated in RGB).
     Supports:
@@ -52,8 +55,8 @@ def gt_to_gray3(x: torch.Tensor, *, weights=(0.299, 0.587, 0.114)) -> torch.Tens
             raise ValueError(f"Expected C=1 or 3 for CHW, got {x.shape}")
         r, g, b = x[0:1], x[1:2], x[2:3]
         y = weights[0] * r + weights[1] * g + weights[2] * b  # (1,H,W)
-        return y.repeat(3, 1, 1)
-
+        return y
+    
     if x.dim() == 4:
         n, c, h, w = x.shape
         if c == 1:
@@ -62,9 +65,10 @@ def gt_to_gray3(x: torch.Tensor, *, weights=(0.299, 0.587, 0.114)) -> torch.Tens
             raise ValueError(f"Expected C=1 or 3 for NCHW, got {x.shape}")
         r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
         y = weights[0] * r + weights[1] * g + weights[2] * b  # (N,1,H,W)
-        return y.repeat(1, 3, 1, 1)
-
+        return y
+    
     raise ValueError(f"Expected CHW or NCHW tensor, got dim={x.dim()}, shape={tuple(x.shape)}")
+
 
 def _sanitize_expname(name: str) -> str:
     """
@@ -337,6 +341,9 @@ def training(
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+    if two_stage:
+        print("[INFO] Two-stage training enabled.")
+        gaussians.convert_SHs_to_Gray()
     gaussians.training_setup(opt)
 
     if checkpoint:
@@ -404,6 +411,13 @@ def training(
         # Stage selection
         in_stage2 = (stage2_start_iter is not None) and (iteration >= stage2_start_iter)
         cur_stage = "stage2" if in_stage2 else "stage1"
+        if not in_stage2 and two_stage:
+            bg_color = [1,] if dataset.white_background else [0,]
+
+        else:
+            bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         # Stage2 warmup status
         if in_stage2 and stage2_start_iter is not None:
@@ -415,6 +429,7 @@ def training(
 
         # Stage2 init (once)
         if in_stage2 and (iteration == stage2_start_iter) and (not stage2_initialized):
+            gaussians.convert_SHs_to_RGB()
             setup_stage2_optimizer(
                 gaussians, opt,
                 feature_lr_scale=stage2_feature_lr_scale,
@@ -502,19 +517,18 @@ def training(
         gt_image = viewpoint_cam.original_image.cuda()
         if gt_image.shape[0] == 1:
             gt_image = gt_image.repeat(3, 1, 1)
-
         image_c = torch.clamp(image, 0.0, 1.0)
         gt_c = torch.clamp(gt_image, 0.0, 1.0)
 
         # Stage1 uses gray3 GT; Stage2 uses RGB GT
-        if not in_stage2:
-            gt_c = gt_to_gray3(gt_c)
-
+        if not in_stage2 and two_stage:
+            gt_c = gt_to_gray1(gt_c)
         # RGB loss ALWAYS
         loss, Ll1 = compute_rgb_loss(image_c, gt_c, opt)
 
         loss.backward()
         iter_end.record()
+        torch.cuda.synchronize()
 
         with torch.no_grad():
             # Stage2 warmup (only affects SH/opacity groups)
@@ -528,9 +542,11 @@ def training(
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            elapsed_time = iter_start.elapsed_time(iter_end) # in ms
+                        
             training_report(
                 tb_writer, iteration, Ll1, loss, l1_loss,
-                iter_start.elapsed_time(iter_end),
+                elapsed_time,
                 testing_iterations,
                 scene, render,
                 (pipe, background),
@@ -715,8 +731,8 @@ if __name__ == "__main__":
 
     args.save_iterations.append(args.iterations)
     test_iterations = (
-        [x for x in range(0, args.iterations + 1, 2000)]
-        + [x for x in range(max(0, args.iterations - args.rgb_finetune_iters), args.iterations + 1, 100)]
+        #[x for x in range(0, args.iterations + 1, 2000)]
+         [x for x in range(max(0, args.iterations - args.rgb_finetune_iters), args.iterations + 1, 100)]
     )
 
     print("Optimizing " + str(args.model_path))
